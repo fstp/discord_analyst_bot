@@ -53,10 +53,8 @@ async fn main() {
                 let mut rsp = true;
                 println!("Received: {}", style(&msg).cyan());
                 match msg.as_str() {
-                    "help" => print_help(),
-                    "h" => print_help(),
-                    "quit" => rsp = false,
-                    "q" => rsp = false,
+                    "help" | "h" => print_help(),
+                    "quit" | "q" => rsp = false,
                     _ => ()
                 }
                 main_tx.send(rsp).await.unwrap();
