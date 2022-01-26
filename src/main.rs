@@ -1,8 +1,32 @@
 //#![feature(unboxed_closures)]
 
 use dialoguer::Input;
-use std::thread;
+use std::{thread, collections::HashMap};
 use console::style;
+use serde::{Serialize, Deserialize};
+//use serde_json::Result;
+use tokio::fs;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SourceChannel {
+    name: String,
+    tag: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct TargetChannel {
+    name: String,
+    tag: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Data {
+    source_channels: Vec<SourceChannel>,
+    target_channels: Vec<TargetChannel>,
+    tag_mapping: HashMap<String, Vec<String>>,
+}
 
 fn print_help() {
     let spring_green = console::Color::Color256(29);
@@ -49,6 +73,11 @@ fn print_help() {
         \t{}\n \
         \t\tDisconnects from Discord and exits.\n\n \
         \t{}\n \
+        \t\tStore the current state into \"data.json\"\n\n \
+        \t{}\n \
+        \t\tLoad state from \"data.json\".\n \
+        \t\t{} This will override any existing state that has not yet been saved.\n \
+        \t{}\n \
         \t\tShow this help message.\n",
     style("Commands:").fg(spring_green),
     style("activate").cyan(),
@@ -63,11 +92,19 @@ fn print_help() {
     style("mention-").cyan(), style("#channel [<tag>] [@role]").green(), style("ALL").red(),
     style("recall").cyan(), style("<#>").green(),
     style("quit").cyan(),
+    style("save").cyan(),
+    style("load").cyan(), style("Warning:").red(),
     style("help").cyan());
 }
 
 #[tokio::main]
 async fn main() {
+    let mut data = Data {
+        source_channels: Vec::default(),
+        target_channels: Vec::default(),
+        tag_mapping: HashMap::default(),
+    };
+
     let (cli_tx, mut cli_rx) = tokio::sync::mpsc::channel::<String>(1);
     let (main_tx, mut main_rx) = tokio::sync::mpsc::channel::<bool>(1);
 
@@ -95,10 +132,20 @@ async fn main() {
             // Input from the CLI.
             Some(msg) = cli_rx.recv() => {
                 let mut rsp = true;
-                println!("Received: {}", style(&msg).cyan());
                 match msg.as_str() {
                     "help" | "h" => print_help(),
                     "quit" | "q" => rsp = false,
+                    "save" | "s" => {
+                        let serialized = serde_json::to_string_pretty(&data).unwrap();
+                        let mut file = File::create("data.json").await.unwrap();
+                        file.write_all(serialized.as_bytes()).await.unwrap();
+                        println!("{}:\n{}", style("Serialized").cyan(), serialized);
+                    }
+                    "load" | "l" => {
+                        let json = fs::read_to_string("data.json").await.unwrap();
+                        data = serde_json::from_str(&json).unwrap();
+                        println!("{}:\n{:#?}", style("Deserialized").cyan(), data);
+                    }
                     _ => ()
                 }
                 main_tx.send(rsp).await.unwrap();
