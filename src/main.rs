@@ -146,6 +146,9 @@ async fn main() {
                         data = serde_json::from_str(&json).unwrap();
                         println!("{}:\n{:#?}", style("Deserialized").cyan(), data);
                     }
+                    "debug_dump" => {
+                        println!("{:#?}", data);
+                    }
                     _ => ()
                 }
                 main_tx.send(rsp).await.unwrap();

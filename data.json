@@ -1,10 +1,5 @@
 {
-  "source_channels": [
-    {
-      "name": "test",
-      "tag": "1"
-    }
-  ],
+  "source_channels": [],
   "target_channels": [],
   "tag_mapping": {}
 }
