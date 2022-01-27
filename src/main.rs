@@ -1,21 +1,22 @@
 //#![feature(unboxed_closures)]
 
-use dialoguer::Input;
-use std::{thread, collections::HashMap};
 use console::style;
-use serde::{Serialize, Deserialize};
+use dialoguer::Input;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::thread;
 //use serde_json::Result;
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 struct SourceChannel {
     name: String,
     tag: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 struct TargetChannel {
     name: String,
     tag: String,
@@ -23,13 +24,14 @@ struct TargetChannel {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Data {
-    source_channels: Vec<SourceChannel>,
-    target_channels: Vec<TargetChannel>,
-    tag_mapping: HashMap<String, Vec<String>>,
+    source_channels: HashSet<SourceChannel>,
+    target_channels: HashSet<TargetChannel>,
+    tag_mapping: HashMap<String, HashSet<String>>,
 }
 
+const SPRING_GREEN: console::Color = console::Color::Color256(29);
+
 fn print_help() {
-    let spring_green = console::Color::Color256(29);
     println!(
         "{}\n \
         \t{}\n \
@@ -79,7 +81,7 @@ fn print_help() {
         \t\t{} This will override any existing state that has not yet been saved.\n \
         \t{}\n \
         \t\tShow this help message.\n",
-    style("Commands:").fg(spring_green),
+    style("Commands:").fg(SPRING_GREEN),
     style("activate").cyan(),
     style("deactivate").cyan(),
     style("source+").cyan(), style("#channel <tag>").green(),
@@ -97,11 +99,81 @@ fn print_help() {
     style("help").cyan());
 }
 
+fn add_mapping(source_tag: String, target_tag: String, data: &mut Data) {
+    // First check if the source tag already exists in the mapping.
+    if data.tag_mapping.contains_key(&source_tag) {
+        let target_tags = data.tag_mapping.get_mut(&source_tag).unwrap();
+        target_tags.insert(target_tag);
+    } else {
+        // This is the first occurence of source tag so create a new association.
+        data.tag_mapping.insert(source_tag, HashSet::from([target_tag]));
+    }
+}
+
+async fn handle_input(msg: String, data: &mut Data) -> bool {
+    let mut rsp = true;
+    let parts: Vec<&str> = msg.split_whitespace().collect();
+    println!("{:#?}", parts);
+    match parts[0] {
+        "help" | "h" => print_help(),
+        "quit" | "q" => rsp = false,
+        "save" | "s" => {
+            let serialized = serde_json::to_string_pretty(&data).unwrap();
+            let mut file = File::create("data.json").await.unwrap();
+            file.write_all(serialized.as_bytes()).await.unwrap();
+            println!("{}:\n{}", style("Serialized").cyan(), serialized);
+        }
+        "load" | "l" => {
+            let json = fs::read_to_string("data.json").await.unwrap();
+            *data = serde_json::from_str(&json).unwrap();
+            println!("{}:\n{:#?}", style("Deserialized").cyan(), data);
+        }
+        "debug_dump" => {
+            println!("{:#?}", data);
+        }
+        "source+" if parts.len() == 3 => {
+            let source_channel = SourceChannel {
+                name: parts[1].to_owned(),
+                tag: parts[2].to_owned(),
+            };
+            data.source_channels.insert(source_channel);
+        }
+        "target+" if parts.len() == 3 => {
+            let target_channel = TargetChannel {
+                name: parts[1].to_owned(),
+                tag: parts[2].to_owned(),
+            };
+            // Make sure we actually have a source channel with the tag.
+            if data
+                .source_channels
+                .iter()
+                .any(|ch| ch.tag == target_channel.tag)
+            {
+                let source_tag = target_channel.tag.clone();
+                let target_tag = target_channel.name.clone();
+                data.target_channels.insert(target_channel);
+                add_mapping(source_tag, target_tag, data);
+            } else {
+                // No source channel found.
+                println!(
+                    "{} No source channel with the tag: {}",
+                    style("[Error]").red(),
+                    style(target_channel.tag).green()
+                );
+            }
+        }
+        _ => {
+            print_help();
+        }
+    }
+    return rsp;
+}
+
 #[tokio::main]
 async fn main() {
     let mut data = Data {
-        source_channels: Vec::default(),
-        target_channels: Vec::default(),
+        source_channels: HashSet::default(),
+        target_channels: HashSet::default(),
         tag_mapping: HashMap::default(),
     };
 
@@ -131,26 +203,7 @@ async fn main() {
         tokio::select! {
             // Input from the CLI.
             Some(msg) = cli_rx.recv() => {
-                let mut rsp = true;
-                match msg.as_str() {
-                    "help" | "h" => print_help(),
-                    "quit" | "q" => rsp = false,
-                    "save" | "s" => {
-                        let serialized = serde_json::to_string_pretty(&data).unwrap();
-                        let mut file = File::create("data.json").await.unwrap();
-                        file.write_all(serialized.as_bytes()).await.unwrap();
-                        println!("{}:\n{}", style("Serialized").cyan(), serialized);
-                    }
-                    "load" | "l" => {
-                        let json = fs::read_to_string("data.json").await.unwrap();
-                        data = serde_json::from_str(&json).unwrap();
-                        println!("{}:\n{:#?}", style("Deserialized").cyan(), data);
-                    }
-                    "debug_dump" => {
-                        println!("{:#?}", data);
-                    }
-                    _ => ()
-                }
+                let rsp = handle_input(msg, &mut data).await;
                 main_tx.send(rsp).await.unwrap();
             }
             // CLI channel dropped, time to exit.
