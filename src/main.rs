@@ -1,4 +1,4 @@
-//#![feature(unboxed_closures)]
+#![feature(hash_drain_filter)]
 
 use console::style;
 use dialoguer::Input;
@@ -99,15 +99,15 @@ fn print_help() {
     style("help").cyan());
 }
 
-fn add_mapping(source_tag: String, target_tag: String, data: &mut Data) {
+fn add_mapping(source_tag: String, target_name: String, data: &mut Data) {
     // First check if the source tag already exists in the mapping.
     if data.tag_mapping.contains_key(&source_tag) {
-        let target_tags = data.tag_mapping.get_mut(&source_tag).unwrap();
-        target_tags.insert(target_tag);
+        let target_names = data.tag_mapping.get_mut(&source_tag).unwrap();
+        target_names.insert(target_name);
     } else {
         // This is the first occurence of source tag so create a new association.
         data.tag_mapping
-            .insert(source_tag, HashSet::from([target_tag]));
+            .insert(source_tag, HashSet::from([target_name]));
     }
 }
 
@@ -137,7 +137,18 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
                 name: parts[1].to_owned(),
                 tag: parts[2].to_owned(),
             };
+            let source_tag = source_channel.tag.clone();
             data.source_channels.insert(source_channel);
+            // Reconnect any orphan target channels with this tag.
+            let mut mappings: Vec<(String, String)> = Vec::default();
+            for ch in  &data.target_channels {
+                if &ch.source_tag == &source_tag {
+                    mappings.push((ch.source_tag.clone(), ch.name.clone()));
+                }
+            }
+            for m in mappings {
+                add_mapping(m.0, m.1, data);
+            }
         }
         "target+" if parts.len() == 3 => {
             let target_channel = TargetChannel {
@@ -180,6 +191,17 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
                     style("[Error]").red(),
                     source_channel
                 );
+            }
+        }
+        "source-" if parts.len() == 2 => {
+            // Not specifying tag so remove all instances.
+            let name = parts[1].to_owned();
+            let drained: Vec<SourceChannel> = data
+                .source_channels
+                .drain_filter(|ch| ch.name == name)
+                .collect();
+            for ch in drained {
+                data.tag_mapping.remove(&ch.tag);
             }
         }
         _ => {
