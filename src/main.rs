@@ -19,7 +19,7 @@ struct SourceChannel {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 struct TargetChannel {
     name: String,
-    tag: String,
+    source_tag: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -106,7 +106,8 @@ fn add_mapping(source_tag: String, target_tag: String, data: &mut Data) {
         target_tags.insert(target_tag);
     } else {
         // This is the first occurence of source tag so create a new association.
-        data.tag_mapping.insert(source_tag, HashSet::from([target_tag]));
+        data.tag_mapping
+            .insert(source_tag, HashSet::from([target_tag]));
     }
 }
 
@@ -141,15 +142,15 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
         "target+" if parts.len() == 3 => {
             let target_channel = TargetChannel {
                 name: parts[1].to_owned(),
-                tag: parts[2].to_owned(),
+                source_tag: parts[2].to_owned(),
             };
             // Make sure we actually have a source channel with the tag.
             if data
                 .source_channels
                 .iter()
-                .any(|ch| ch.tag == target_channel.tag)
+                .any(|ch| ch.tag == target_channel.source_tag)
             {
-                let source_tag = target_channel.tag.clone();
+                let source_tag = target_channel.source_tag.clone();
                 let target_tag = target_channel.name.clone();
                 data.target_channels.insert(target_channel);
                 add_mapping(source_tag, target_tag, data);
@@ -158,7 +159,26 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
                 println!(
                     "{} No source channel with the tag: {}",
                     style("[Error]").red(),
-                    style(target_channel.tag).green()
+                    target_channel.source_tag
+                );
+            }
+        }
+        "source-" if parts.len() == 3 => {
+            // <tag> is a parameter.
+            // Only remove the instance with both name/tag matching.
+            let source_channel = SourceChannel {
+                name: parts[1].to_owned(),
+                tag: parts[2].to_owned(),
+            };
+            if data.source_channels.remove(&source_channel) {
+                // Source channel existed, now remove any mapping for it.
+                data.tag_mapping.remove(&source_channel.tag);
+            } else {
+                // No such channel found, error.
+                println!(
+                    "{} No such source channel:\n{:#?}",
+                    style("[Error]").red(),
+                    source_channel
                 );
             }
         }
