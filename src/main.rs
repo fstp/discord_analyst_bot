@@ -24,7 +24,7 @@ struct TargetChannel {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Data {
-    source_channels: HashSet<SourceChannel>,
+    source_channels: HashMap<String, SourceChannel>,
     target_channels: HashSet<TargetChannel>,
     tag_mapping: HashMap<String, HashSet<String>>,
 }
@@ -129,7 +129,7 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
             *data = serde_json::from_str(&json).unwrap();
             println!("{}:\n{:#?}", style("Deserialized").cyan(), data);
         }
-        "debug_dump" => {
+        "debug_dump" | "dd" => {
             println!("{:#?}", data);
         }
         "source+" if parts.len() == 3 => {
@@ -138,10 +138,11 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
                 tag: parts[2].to_owned(),
             };
             let source_tag = source_channel.tag.clone();
-            data.source_channels.insert(source_channel);
+            data.source_channels
+                .insert(source_tag.clone(), source_channel);
             // Reconnect any orphan target channels with this tag.
             let mut mappings: Vec<(String, String)> = Vec::default();
-            for ch in  &data.target_channels {
+            for ch in &data.target_channels {
                 if &ch.source_tag == &source_tag {
                     mappings.push((ch.source_tag.clone(), ch.name.clone()));
                 }
@@ -158,8 +159,7 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
             // Make sure we actually have a source channel with the tag.
             if data
                 .source_channels
-                .iter()
-                .any(|ch| ch.tag == target_channel.source_tag)
+                .contains_key(&target_channel.source_tag)
             {
                 let source_tag = target_channel.source_tag.clone();
                 let target_tag = target_channel.name.clone();
@@ -176,32 +176,34 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
         }
         "source-" if parts.len() == 3 => {
             // <tag> is a parameter.
-            // Only remove the instance with both name/tag matching.
             let source_channel = SourceChannel {
                 name: parts[1].to_owned(),
                 tag: parts[2].to_owned(),
             };
-            if data.source_channels.remove(&source_channel) {
-                // Source channel existed, now remove any mapping for it.
-                data.tag_mapping.remove(&source_channel.tag);
-            } else {
-                // No such channel found, error.
-                println!(
-                    "{} No such source channel:\n{:#?}",
-                    style("[Error]").red(),
-                    source_channel
-                );
+            match data.source_channels.remove(&source_channel.tag) {
+                Some(_) => {
+                    // Source channel existed, now remove any mapping for it.
+                    data.tag_mapping.remove(&source_channel.tag);
+                }
+                None => {
+                    // No such channel found, error.
+                    println!(
+                        "{} No such source channel:\n{:#?}",
+                        style("[Error]").red(),
+                        source_channel
+                    );
+                }
             }
         }
         "source-" if parts.len() == 2 => {
             // Not specifying tag so remove all instances.
             let name = parts[1].to_owned();
-            let drained: Vec<SourceChannel> = data
+            let drained: Vec<(String, SourceChannel)> = data
                 .source_channels
-                .drain_filter(|ch| ch.name == name)
+                .drain_filter(|_tag, ch| ch.name == name)
                 .collect();
             for ch in drained {
-                data.tag_mapping.remove(&ch.tag);
+                data.tag_mapping.remove(&ch.0);
             }
         }
         _ => {
@@ -214,7 +216,7 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
 #[tokio::main]
 async fn main() {
     let mut data = Data {
-        source_channels: HashSet::default(),
+        source_channels: HashMap::default(),
         target_channels: HashSet::default(),
         tag_mapping: HashMap::default(),
     };
