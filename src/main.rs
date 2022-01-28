@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::thread;
 //use serde_json::Result;
+use comfy_table::presets::UTF8_FULL;
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
+use itertools::Itertools;
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -80,6 +83,8 @@ fn print_help() {
         \t\tLoad state from \"data.json\".\n \
         \t\t{} This will override any existing state that has not yet been saved.\n \
         \t{}\n \
+        \t\tPrint a table with the currently connected source/target channels.\n \
+        \t{}\n \
         \t\tShow this help message.\n",
     style("Commands:").fg(SPRING_GREEN),
     style("activate").cyan(),
@@ -96,6 +101,7 @@ fn print_help() {
     style("quit").cyan(),
     style("save").cyan(),
     style("load").cyan(), style("Warning:").red(),
+    style("status").cyan(),
     style("help").cyan());
 }
 
@@ -205,6 +211,34 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
             for ch in drained {
                 data.tag_mapping.remove(&ch.0);
             }
+        }
+        "status" => {
+            let mut table = Table::new();
+            let header = vec![
+                Cell::new("Source Channel").add_attribute(Attribute::Bold),
+                Cell::new("Target Channel(s)").add_attribute(Attribute::Bold),
+            ];
+            let mut rows: Vec<Vec<Cell>> = Vec::default();
+            for (tag, ch) in &data.source_channels {
+                // Only include source channel in the table if it has
+                // any targets mapped to it.
+                if data.tag_mapping.contains_key(tag) {
+                    let targets = data.tag_mapping.get(tag).unwrap().iter().format("\n");
+                    rows.push(vec![
+                        Cell::new(format!("{} [{}]", ch.name, ch.tag)).fg(Color::Cyan),
+                        Cell::new(format!("{}", targets)).fg(Color::Cyan),
+                    ]);
+                }
+            }
+            table
+                .load_preset(UTF8_FULL)
+                .set_content_arrangement(ContentArrangement::Dynamic)
+                .set_table_width(80)
+                .set_header(header);
+            for row in rows {
+                table.add_row(row);
+            }
+            println!("{table}");
         }
         _ => {
             print_help();
