@@ -5,10 +5,16 @@ use dialoguer::Input;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::thread;
+use std::sync::Arc;
 //use serde_json::Result;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use itertools::Itertools;
+use serenity::{
+    async_trait,
+    model::{channel::Message, gateway::Ready},
+    prelude::*,
+};
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -117,15 +123,16 @@ fn add_mapping(source_tag: String, target_name: String, data: &mut Data) {
     }
 }
 
-async fn handle_input(msg: String, data: &mut Data) -> bool {
+async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
     let mut rsp = true;
     let parts: Vec<&str> = msg.split_whitespace().collect();
     println!("{:#?}", parts);
+    let mut data = data.lock().await;
     match parts[0] {
         "help" | "h" => print_help(),
         "quit" | "q" => rsp = false,
         "save" | "s" => {
-            let serialized = serde_json::to_string_pretty(&data).unwrap();
+            let serialized = serde_json::to_string_pretty(&*data).unwrap();
             let mut file = File::create("data.json").await.unwrap();
             file.write_all(serialized.as_bytes()).await.unwrap();
             println!("{}:\n{}", style("Serialized").cyan(), serialized);
@@ -154,7 +161,7 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
                 }
             }
             for m in mappings {
-                add_mapping(m.0, m.1, data);
+                add_mapping(m.0, m.1, &mut *data);
             }
         }
         "target+" if parts.len() == 3 => {
@@ -170,7 +177,7 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
                 let source_tag = target_channel.source_tag.clone();
                 let target_tag = target_channel.name.clone();
                 data.target_channels.insert(target_channel);
-                add_mapping(source_tag, target_tag, data);
+                add_mapping(source_tag, target_tag, &mut *data);
             } else {
                 // No source channel found.
                 println!(
@@ -247,14 +254,57 @@ async fn handle_input(msg: String, data: &mut Data) -> bool {
     return rsp;
 }
 
+struct Handler {
+    data: Arc<Mutex<Data>>
+}
+
+#[async_trait]
+impl EventHandler for Handler {
+    // Set a handler for the `message` event - so that whenever a new message
+    // is received - the closure (or function) passed will be called.
+    //
+    // Event handlers are dispatched through a threadpool, and so multiple
+    // events can be dispatched simultaneously.
+    async fn message(&self, ctx: Context, msg: Message) {
+        println!("Msg: {}", msg.content);
+        if msg.content == "!ping" {
+            // Sending a message can fail, due to a network error, an
+            // authentication error, or lack of permissions to post in the
+            // channel, so log to stdout when some error happens, with a
+            // description of it.
+            if let Err(why) = msg.channel_id.say(&ctx.http, "Pong!").await {
+                println!("Error sending message: {:?}", why);
+            }
+        }
+    }
+
+    // Set a handler to be called on the `ready` event. This is called when a
+    // shard is booted, and a READY payload is sent by Discord. This payload
+    // contains data like the current user's guild Ids, current user data,
+    // private channels, and more.
+    //
+    // In this case, just print what the current user's username is.
+    async fn ready(&self, _: Context, ready: Ready) {
+        println!("{} is connected!", ready.user.name);
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let mut data = Data {
+    let data: Arc<Mutex<Data>> = Arc::new(Mutex::new(Data {
         source_channels: HashMap::default(),
         target_channels: HashSet::default(),
         tag_mapping: HashMap::default(),
-    };
+    }));
 
+    let discord_token = "OTM2NjA3Nzg4NDkzMzA3OTQ0.YfPp-g.-66HLmbJ1Bu0GFxsDcNdX0LcklY";
+
+    let mut client = Client::builder(&discord_token)
+        .event_handler(Handler { data: data.clone() })
+        .await
+        .expect("Error creating Discord client");
+
+    let (exit_tx, mut exit_rx) = tokio::sync::mpsc::channel::<bool>(1);
     let (cli_tx, mut cli_rx) = tokio::sync::mpsc::channel::<String>(1);
     let (main_tx, mut main_rx) = tokio::sync::mpsc::channel::<bool>(1);
 
@@ -276,16 +326,22 @@ async fn main() {
     // Kick off the CLI.
     main_tx.send(true).await.unwrap();
 
+    tokio::spawn(async move {
+        if let Err(why) = client.start().await {
+            println!("Client error: {:?}", why);
+        }
+    });
+
     // Main event loop.
     loop {
         tokio::select! {
             // Input from the CLI.
             Some(msg) = cli_rx.recv() => {
-                let rsp = handle_input(msg, &mut data).await;
+                let rsp = handle_input(msg, data.clone()).await;
                 main_tx.send(rsp).await.unwrap();
+                exit_tx.send(rsp).await.unwrap();
             }
-            // CLI channel dropped, time to exit.
-            else => {
+            Some(false) = exit_rx.recv() => {
                 println!("Exiting...");
                 break
             }
