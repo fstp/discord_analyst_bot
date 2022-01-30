@@ -4,8 +4,8 @@ use console::style;
 use dialoguer::Input;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::thread;
 use std::sync::Arc;
+use std::thread;
 //use serde_json::Result;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -181,8 +181,7 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
             } else {
                 // No source channel found.
                 println!(
-                    "{} No source channel with the tag: {}",
-                    style("[Error]").red(),
+                    "No source channel with the tag: {}",
                     target_channel.source_tag
                 );
             }
@@ -255,7 +254,7 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
 }
 
 struct Handler {
-    data: Arc<Mutex<Data>>
+    data: Arc<Mutex<Data>>,
 }
 
 #[async_trait]
@@ -266,13 +265,19 @@ impl EventHandler for Handler {
     // Event handlers are dispatched through a threadpool, and so multiple
     // events can be dispatched simultaneously.
     async fn message(&self, ctx: Context, msg: Message) {
-        println!("Msg: {}", msg.content);
-        if msg.content == "!ping" {
-            // Sending a message can fail, due to a network error, an
-            // authentication error, or lack of permissions to post in the
-            // channel, so log to stdout when some error happens, with a
-            // description of it.
-            if let Err(why) = msg.channel_id.say(&ctx.http, "Pong!").await {
+        // Sending a message can fail, due to a network error, an
+        // authentication error, or lack of permissions to post in the
+        // channel, so log to stdout when some error happens, with a
+        // description of it.
+        let user = msg.author;
+        //let channel_name = msg.channel_id.name(ctx.cache).await.unwrap();
+        if user.bot == false {
+            let str_msg = format!(
+                "{} said: {}",
+                user.mention(),
+                msg.content
+            );
+            if let Err(why) = msg.channel_id.say(&ctx.http, str_msg).await {
                 println!("Error sending message: {:?}", why);
             }
         }
@@ -297,7 +302,20 @@ async fn main() {
         tag_mapping: HashMap::default(),
     }));
 
-    let discord_token = "OTM2NjA3Nzg4NDkzMzA3OTQ0.YfPp-g.-66HLmbJ1Bu0GFxsDcNdX0LcklY";
+    let discord_token = match tokio::fs::read_to_string("token.txt").await {
+        Err(_) => {
+            println!(
+                "Could not read the authentication token from \"token.txt\"\n \
+                 Make sure that the file exists and is located in the same\n \
+                 directory as the bot executable"
+            );
+            return;
+        }
+        Ok(discord_token) => {
+            println!("Discord authentication token: {}", discord_token);
+            discord_token
+        }
+    };
 
     let mut client = Client::builder(&discord_token)
         .event_handler(Handler { data: data.clone() })
