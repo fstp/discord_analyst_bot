@@ -12,6 +12,7 @@ use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use itertools::Itertools;
 use serenity::{
     async_trait,
+    model::id::GuildId,
     model::{channel::Message, gateway::Ready},
     prelude::*,
 };
@@ -22,20 +23,24 @@ use tokio::io::AsyncWriteExt;
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 struct SourceChannel {
     name: String,
-    tag: String,
+    channel_tag: String,
+    server_tag: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 struct TargetChannel {
     name: String,
     source_tag: String,
+    server_tag: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct Data {
     source_channels: HashMap<String, SourceChannel>,
     target_channels: HashSet<TargetChannel>,
-    tag_mapping: HashMap<String, HashSet<String>>,
+    channel_mapping: HashMap<String, HashSet<String>>,
+    server_mapping: HashMap<String, String>,
+    connected_servers: HashSet<String>,
 }
 
 const SPRING_GREEN: console::Color = console::Color::Color256(29);
@@ -43,21 +48,21 @@ const SPRING_GREEN: console::Color = console::Color::Color256(29);
 fn print_help() {
     println!(
         "{}\n \
-        \t{}\n \
-        \t\tActivates the bot and connects to Discord.\n\n \
-        \t{}\n \
-        \t\tDisconnects from Discord, does not exit.\n\n \
         \t{} {}\n \
-        \t\tAdds a new source channel. The <tag> refers to the indicator to specify a channel.\n \
+        \t\tAdds a new server where the bot can operate. The <server-tag> will refer to this server\n \
+        \t\twhen creating source/target channels so that the bot can connect one source with a target\n \
+        \t\ton another server.\n \
+        \t{} {}\n \
+        \t\tAdds a new source channel. The <channel-tag> refers to the indicator to specify a channel.\n \
         \t\tEg. If an analyst alerts stocks and options, they may designate 1 as the stocks channel tag\n \
         \t\tand 2 as the options channel tag, or they may use the words \"stocks\" and \"options\" if they want.\n\n \
         \t{} {}\n \
-        \t\tRemoves a source channel. The <tag> is optional. Excluding this tag would erase the whole channel\n \
-        \t\tfrom the bot's db. Including the <#> would only remove that instance\n \
+        \t\tRemoves a source channel. The <channel-tag> is optional. Excluding this tag would erase the\n \
+        \t\twhole channel from the bot's db. Including the <#> would only remove that instance\n \
         \t\t(in the event that someone has multiple tags assigned to the same source channel).\n\n \
         \t{} {}\n \
         \t\tAdds a new target channel to the server in which the command is typed..\n \
-        \t\tThe <tag> refers to the numerical tag and ties to the corresponding source tag.\n \
+        \t\tThe <channel-tag> refers to the numerical tag and ties to the corresponding source tag.\n \
         \t\tOne target channel can link to more than one source channel.\n\n \
         \t{}\n \
         \t\tLists all servers that the bot is installed in, including server ID and server name,\n \
@@ -93,11 +98,10 @@ fn print_help() {
         \t{}\n \
         \t\tShow this help message.\n",
     style("Commands:").fg(SPRING_GREEN),
-    style("activate").cyan(),
-    style("deactivate").cyan(),
-    style("source+").cyan(), style("#channel <tag>").green(),
-    style("source-").cyan(), style("#channel <tag>").green(),
-    style("target+").cyan(), style("#channel <tag>").green(),
+    style("server+").cyan(), style("<server-tag> name").green(),
+    style("source+").cyan(), style("<server-tag> #channel <channel-tag>").green(),
+    style("source-").cyan(), style("<server-tag> #channel <channel-tag>").green(),
+    style("target+").cyan(), style("<server-tag> #channel <channel-tag>").green(),
     style("serverlist").cyan(),
     style("serverbanlist+").cyan(), style("<Server ID>").green(),
     style("serverbanlist-").cyan(), style("<Server ID>").green(),
@@ -113,12 +117,12 @@ fn print_help() {
 
 fn add_mapping(source_tag: String, target_name: String, data: &mut Data) {
     // First check if the source tag already exists in the mapping.
-    if data.tag_mapping.contains_key(&source_tag) {
-        let target_names = data.tag_mapping.get_mut(&source_tag).unwrap();
+    if data.channel_mapping.contains_key(&source_tag) {
+        let target_names = data.channel_mapping.get_mut(&source_tag).unwrap();
         target_names.insert(target_name);
     } else {
         // This is the first occurence of source tag so create a new association.
-        data.tag_mapping
+        data.channel_mapping
             .insert(source_tag, HashSet::from([target_name]));
     }
 }
@@ -126,7 +130,6 @@ fn add_mapping(source_tag: String, target_name: String, data: &mut Data) {
 async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
     let mut rsp = true;
     let parts: Vec<&str> = msg.split_whitespace().collect();
-    println!("{:#?}", parts);
     let mut data = data.lock().await;
     match parts[0] {
         "help" | "h" => print_help(),
@@ -145,15 +148,21 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
         "debug_dump" | "dd" => {
             println!("{:#?}", data);
         }
-        "source+" if parts.len() == 3 => {
+        "server+" if parts.len() == 3 => {
+            let server_tag = parts[1].to_owned();
+            let server_name = parts[2].to_owned();
+            data.server_mapping.insert(server_tag, server_name);
+        }
+        "source+" if parts.len() == 4 => {
             let source_channel = SourceChannel {
-                name: parts[1].to_owned(),
-                tag: parts[2].to_owned(),
+                server_tag: parts[1].to_owned(),
+                name: parts[2].to_owned(),
+                channel_tag: parts[3].to_owned(),
             };
-            let source_tag = source_channel.tag.clone();
+            let source_tag = source_channel.channel_tag.clone();
             data.source_channels
                 .insert(source_tag.clone(), source_channel);
-            // Reconnect any orphan target channels with this tag.
+            // Reconnect any orphan target channels with this channel tag.
             let mut mappings: Vec<(String, String)> = Vec::default();
             for ch in &data.target_channels {
                 if &ch.source_tag == &source_tag {
@@ -164,12 +173,14 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
                 add_mapping(m.0, m.1, &mut *data);
             }
         }
-        "target+" if parts.len() == 3 => {
+        "target+" if parts.len() == 4 => {
             let target_channel = TargetChannel {
-                name: parts[1].to_owned(),
-                source_tag: parts[2].to_owned(),
+                server_tag: parts[1].to_owned(),
+                name: parts[2].to_owned(),
+                source_tag: parts[3].to_owned(),
             };
-            // Make sure we actually have a source channel with the tag.
+            // Make sure we actually have a corresponding
+            // source channel with the tag.
             if data
                 .source_channels
                 .contains_key(&target_channel.source_tag)
@@ -181,43 +192,45 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
             } else {
                 // No source channel found.
                 println!(
-                    "No source channel with the tag: {}",
-                    target_channel.source_tag
+                    "{} No source channel found with tag {}",
+                    style("Error:").red(),
+                    target_channel.source_tag,
                 );
             }
         }
-        "source-" if parts.len() == 3 => {
-            // <tag> is a parameter.
+        "source-" if parts.len() == 4 => {
+            // <channel-tag> is a parameter.
             let source_channel = SourceChannel {
-                name: parts[1].to_owned(),
-                tag: parts[2].to_owned(),
+                server_tag: parts[1].to_owned(),
+                name: parts[2].to_owned(),
+                channel_tag: parts[3].to_owned(),
             };
-            match data.source_channels.remove(&source_channel.tag) {
+            match data.source_channels.remove(&source_channel.channel_tag) {
                 Some(_) => {
                     // Source channel existed, now remove any mapping for it.
-                    data.tag_mapping.remove(&source_channel.tag);
+                    data.channel_mapping.remove(&source_channel.channel_tag);
                 }
                 None => {
                     // No such channel found, error.
                     println!(
                         "{} No such source channel:\n{:#?}",
-                        style("[Error]").red(),
-                        source_channel
+                        style("Error:").red(),
+                        source_channel,
                     );
                 }
             }
         }
-        "source-" if parts.len() == 2 => {
-            // Not specifying tag so remove all instances.
-            let name = parts[1].to_owned();
-            let drained: Vec<(String, SourceChannel)> = data
-                .source_channels
-                .drain_filter(|_tag, ch| ch.name == name)
-                .collect();
-            for ch in drained {
-                data.tag_mapping.remove(&ch.0);
-            }
-        }
+        // "source-" if parts.len() == 2 => {
+        //     // Not specifying tag so remove all instances.
+        //     let name = parts[1].to_owned();
+        //     let drained: Vec<(String, SourceChannel)> = data
+        //         .source_channels
+        //         .drain_filter(|_tag, ch| ch.name == name)
+        //         .collect();
+        //     for ch in drained {
+        //         data.tag_mapping.remove(&ch.0);
+        //     }
+        // }
         "status" => {
             let mut table = Table::new();
             let header = vec![
@@ -228,10 +241,10 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
             for (tag, ch) in &data.source_channels {
                 // Only include source channel in the table if it has
                 // any targets mapped to it.
-                if data.tag_mapping.contains_key(tag) {
-                    let targets = data.tag_mapping.get(tag).unwrap().iter().format("\n");
+                if data.channel_mapping.contains_key(tag) {
+                    let targets = data.channel_mapping.get(tag).unwrap().iter().format("\n");
                     rows.push(vec![
-                        Cell::new(format!("{} [{}]", ch.name, ch.tag)).fg(Color::Cyan),
+                        Cell::new(format!("{} [{}]", ch.name, ch.channel_tag)).fg(Color::Cyan),
                         Cell::new(format!("{}", targets)).fg(Color::Cyan),
                     ]);
                 }
@@ -247,14 +260,31 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
             println!("{table}");
         }
         _ => {
+            println!(
+                "{} Unrecognized command:\n{:#?}",
+                style("Error:").red(),
+                parts
+            );
             print_help();
         }
     }
     return rsp;
 }
 
+async fn prepare_guilds(data: &Arc<Mutex<Data>>, ctx: &Context, guilds: &Vec<GuildId>) {
+    let mut guild_names: Vec<String> = Vec::default();
+    let mut data = data.lock().await;
+    for id in guilds {
+        let name = id.name(&ctx.cache).await.unwrap();
+        data.connected_servers.insert(name.clone());
+        guild_names.push(name);
+    }
+    println!("Connected servers:\n{:#?}", data.connected_servers);
+}
+
 struct Handler {
     data: Arc<Mutex<Data>>,
+    cache_rdy_tx: tokio::sync::mpsc::Sender<bool>,
 }
 
 #[async_trait]
@@ -264,23 +294,25 @@ impl EventHandler for Handler {
     //
     // Event handlers are dispatched through a threadpool, and so multiple
     // events can be dispatched simultaneously.
-    async fn message(&self, ctx: Context, msg: Message) {
+    async fn message(&self, _ctx: Context, _msg: Message) {
         // Sending a message can fail, due to a network error, an
         // authentication error, or lack of permissions to post in the
         // channel, so log to stdout when some error happens, with a
         // description of it.
-        let user = msg.author;
-        //let channel_name = msg.channel_id.name(ctx.cache).await.unwrap();
-        if user.bot == false {
-            let str_msg = format!(
-                "{} said: {}",
-                user.mention(),
-                msg.content
-            );
-            if let Err(why) = msg.channel_id.say(&ctx.http, str_msg).await {
-                println!("Error sending message: {:?}", why);
-            }
-        }
+        // let user = msg.author;
+        // if user.bot == false {
+        //     let guild_name = msg.guild_id.unwrap().name(ctx.cache).await.unwrap();
+        //     let str_msg = format!(
+        //         "{} said in {} ({}): {}",
+        //         user.mention(),
+        //         msg.channel_id.mention(),
+        //         guild_name,
+        //         msg.content,
+        //     );
+        //     if let Err(why) = msg.channel_id.say(&ctx.http, str_msg).await {
+        //         println!("Error sending message: {:?}", why);
+        //     }
+        // }
     }
 
     // Set a handler to be called on the `ready` event. This is called when a
@@ -292,15 +324,25 @@ impl EventHandler for Handler {
     async fn ready(&self, _: Context, ready: Ready) {
         println!("{} is connected!", ready.user.name);
     }
+
+    async fn cache_ready(&self, ctx: Context, guilds: Vec<GuildId>) {
+        prepare_guilds(&self.data, &ctx, &guilds).await;
+        self.cache_rdy_tx
+            .send(true)
+            .await
+            .expect("Failed to send cache ready");
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let data: Arc<Mutex<Data>> = Arc::new(Mutex::new(Data {
-        source_channels: HashMap::default(),
-        target_channels: HashSet::default(),
-        tag_mapping: HashMap::default(),
-    }));
+    // let data: Arc<Mutex<GuildData>> = Arc::new(Mutex::new(GuildData {
+    //     source_channels: HashMap::default(),
+    //     target_channels: HashSet::default(),
+    //     tag_mapping: HashMap::default(),
+    // }));
+    let data: Arc<Mutex<Data>> = Arc::new(Mutex::new(Data::default()));
+    let (cache_rdy_tx, mut cache_rdy_rx) = tokio::sync::mpsc::channel::<bool>(1);
 
     let discord_token = match tokio::fs::read_to_string("token.txt").await {
         Err(_) => {
@@ -318,9 +360,22 @@ async fn main() {
     };
 
     let mut client = Client::builder(&discord_token)
-        .event_handler(Handler { data: data.clone() })
+        .event_handler(Handler {
+            data: data.clone(),
+            cache_rdy_tx: cache_rdy_tx,
+        })
         .await
         .expect("Error creating Discord client");
+
+    tokio::spawn(async move {
+        if let Err(why) = client.start().await {
+            println!("Client error: {:?}", why);
+            return;
+        }
+    });
+
+    // Discord cache has been received and parsed.
+    cache_rdy_rx.recv().await;
 
     let (exit_tx, mut exit_rx) = tokio::sync::mpsc::channel::<bool>(1);
     let (cli_tx, mut cli_rx) = tokio::sync::mpsc::channel::<String>(1);
@@ -343,12 +398,6 @@ async fn main() {
 
     // Kick off the CLI.
     main_tx.send(true).await.unwrap();
-
-    tokio::spawn(async move {
-        if let Err(why) = client.start().await {
-            println!("Client error: {:?}", why);
-        }
-    });
 
     // Main event loop.
     loop {
