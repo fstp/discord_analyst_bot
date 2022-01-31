@@ -89,12 +89,13 @@ fn print_help() {
         \t{}\n \
         \t\tDisconnects from Discord and exits.\n\n \
         \t{}\n \
-        \t\tStore the current state into \"data.json\"\n\n \
+        \t\tStore the current state into \"data.json\"\n \
+        \t\t{} This will override any existing state that is already stored in the file.\n\n \
         \t{}\n \
         \t\tLoad state from \"data.json\".\n \
-        \t\t{} This will override any existing state that has not yet been saved.\n \
+        \t\t{} This will override any existing state that has not yet been saved.\n\n \
         \t{}\n \
-        \t\tPrint a table with the currently connected source/target channels.\n \
+        \t\tPrint a table with the currently connected source/target channels.\n\n \
         \t{}\n \
         \t\tShow this help message.\n",
     style("Commands:").fg(SPRING_GREEN),
@@ -109,7 +110,7 @@ fn print_help() {
     style("mention-").cyan(), style("#channel [<tag>] [@role]").green(), style("ALL").red(),
     style("recall").cyan(), style("<#>").green(),
     style("quit").cyan(),
-    style("save").cyan(),
+    style("save").cyan(), style("Warning:").red(),
     style("load").cyan(), style("Warning:").red(),
     style("status").cyan(),
     style("help").cyan());
@@ -140,11 +141,20 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
             file.write_all(serialized.as_bytes()).await.unwrap();
             println!("{}:\n{}", style("Serialized").cyan(), serialized);
         }
-        "load" | "l" => {
-            let json = fs::read_to_string("data.json").await.unwrap();
-            *data = serde_json::from_str(&json).unwrap();
-            println!("{}:\n{:#?}", style("Deserialized").cyan(), data);
-        }
+        "load" | "l" => match fs::read_to_string("data.json").await {
+            Ok(json) => {
+                *data = serde_json::from_str(&json).unwrap();
+                println!("{}:\n{:#?}", style("Deserialized").cyan(), data);
+            }
+            Err(why) => {
+                println!(
+                    "{}\nFailed to read the file \"data.json\" (reason: {}) \
+                    \nAre you sure it exists in the same directory as the bot?",
+                    style("Error:").red(),
+                    why,
+                )
+            }
+        },
         "debug_dump" | "dd" => {
             println!("{:#?}", data);
         }
@@ -192,7 +202,7 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
             } else {
                 // No source channel found.
                 println!(
-                    "{} No source channel found with tag {}",
+                    "{}\nNo source channel found with the tag {}",
                     style("Error:").red(),
                     target_channel.source_tag,
                 );
@@ -213,7 +223,7 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
                 None => {
                     // No such channel found, error.
                     println!(
-                        "{} No such source channel:\n{:#?}",
+                        "{}\nNo such source channel\n{:#?}",
                         style("Error:").red(),
                         source_channel,
                     );
@@ -261,11 +271,10 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
         }
         _ => {
             println!(
-                "{} Unrecognized command:\n{:#?}",
+                "{} Unrecognized command\n{:#?}",
                 style("Error:").red(),
                 parts
             );
-            print_help();
         }
     }
     return rsp;
@@ -336,11 +345,6 @@ impl EventHandler for Handler {
 
 #[tokio::main]
 async fn main() {
-    // let data: Arc<Mutex<GuildData>> = Arc::new(Mutex::new(GuildData {
-    //     source_channels: HashMap::default(),
-    //     target_channels: HashSet::default(),
-    //     tag_mapping: HashMap::default(),
-    // }));
     let data: Arc<Mutex<Data>> = Arc::new(Mutex::new(Data::default()));
     let (cache_rdy_tx, mut cache_rdy_rx) = tokio::sync::mpsc::channel::<bool>(1);
 
@@ -348,8 +352,8 @@ async fn main() {
         Err(_) => {
             println!(
                 "Could not read the authentication token from \"token.txt\"\n \
-                 Make sure that the file exists and is located in the same\n \
-                 directory as the bot executable"
+                Make sure that the file exists and is located in the same\n \
+                directory as the bot executable"
             );
             return;
         }
