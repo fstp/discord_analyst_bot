@@ -3,11 +3,11 @@
 	"tasks": [
 		{
 			"type": "cargo",
-			"subcommand": "run",
+			"command": "run",
 			"problemMatcher": [
 				"$rustc"
 			],
-			"label": "Rust: cargo run - discord_analyst_bot"
+			"label": "rust: cargo run"
 		}
 	]
 }

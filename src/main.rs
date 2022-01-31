@@ -40,7 +40,7 @@ struct Data {
     target_channels: HashSet<TargetChannel>,
     channel_mapping: HashMap<String, HashSet<String>>,
     server_mapping: HashMap<String, String>,
-    connected_servers: HashSet<String>,
+    next_server_tag: usize,
 }
 
 const SPRING_GREEN: console::Color = console::Color::Color256(29);
@@ -158,9 +158,10 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
         "debug_dump" | "dd" => {
             println!("{:#?}", data);
         }
-        "server+" if parts.len() == 3 => {
+        "server+" if parts.len() > 2 => {
             let server_tag = parts[1].to_owned();
-            let server_name = parts[2].to_owned();
+            let server_name = parts[2..].join(" ");
+            println!("{}", server_name);
             data.server_mapping.insert(server_tag, server_name);
         }
         "source+" if parts.len() == 4 => {
@@ -280,15 +281,16 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
     return rsp;
 }
 
-async fn prepare_guilds(data: &Arc<Mutex<Data>>, ctx: &Context, guilds: &Vec<GuildId>) {
-    let mut guild_names: Vec<String> = Vec::default();
+async fn create_server_mapping(data: &Arc<Mutex<Data>>, ctx: &Context, guilds: &Vec<GuildId>) {
     let mut data = data.lock().await;
     for id in guilds {
         let name = id.name(&ctx.cache).await.unwrap();
-        data.connected_servers.insert(name.clone());
-        guild_names.push(name);
+        let tag = data.next_server_tag.to_string();
+        data.server_mapping
+            .insert(tag, name);
+        data.next_server_tag += 1;
     }
-    println!("Connected servers:\n{:#?}", data.connected_servers);
+    println!("Finished server mapping\n{:#?}", data);
 }
 
 struct Handler {
@@ -331,11 +333,11 @@ impl EventHandler for Handler {
     //
     // In this case, just print what the current user's username is.
     async fn ready(&self, _: Context, ready: Ready) {
-        println!("{} is connected!", ready.user.name);
+        println!("{} is connected to Discord", ready.user.name);
     }
 
     async fn cache_ready(&self, ctx: Context, guilds: Vec<GuildId>) {
-        prepare_guilds(&self.data, &ctx, &guilds).await;
+        create_server_mapping(&self.data, &ctx, &guilds).await;
         self.cache_rdy_tx
             .send(true)
             .await
