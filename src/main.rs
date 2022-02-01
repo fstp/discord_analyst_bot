@@ -1,24 +1,34 @@
 #![feature(hash_drain_filter)]
 
+use comfy_table::presets::UTF8_FULL;
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use console::style;
 use dialoguer::Input;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use serenity::{
+    async_trait,
+    model::channel::{ChannelType, Message},
+    model::gateway::Ready,
+    model::id::{ChannelId, GuildId, WebhookId},
+    prelude::*,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
-//use serde_json::Result;
-use comfy_table::presets::UTF8_FULL;
-use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
-use itertools::Itertools;
-use serenity::{
-    async_trait,
-    model::id::GuildId,
-    model::{channel::Message, gateway::Ready},
-    prelude::*,
-};
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+
+const WEBHOOK_NAME: &str = "Analyst Bot (QkTdmq49PE)";
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+struct Server {
+    name: String,
+    id: GuildId,
+    channels: HashMap<String, ChannelId>,
+    webhooks: HashMap<String, WebhookId>,
+}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 struct SourceChannel {
@@ -39,7 +49,7 @@ struct Data {
     source_channels: HashMap<String, SourceChannel>,
     target_channels: HashSet<TargetChannel>,
     channel_mapping: HashMap<String, HashSet<String>>,
-    server_mapping: HashMap<String, String>,
+    server_mapping: HashMap<String, Server>,
     next_server_tag: usize,
 }
 
@@ -158,12 +168,12 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
         "debug_dump" | "dd" => {
             println!("{:#?}", data);
         }
-        "server+" if parts.len() > 2 => {
-            let server_tag = parts[1].to_owned();
-            let server_name = parts[2..].join(" ");
-            println!("{}", server_name);
-            data.server_mapping.insert(server_tag, server_name);
-        }
+        // "server+" if parts.len() > 2 => {
+        //     let server_tag = parts[1].to_owned();
+        //     let server_name = parts[2..].join(" ");
+        //     println!("{}", server_name);
+        //     data.server_mapping.insert(server_tag, server_name);
+        // }
         "source+" if parts.len() == 4 => {
             let source_channel = SourceChannel {
                 server_tag: parts[1].to_owned(),
@@ -286,8 +296,59 @@ async fn create_server_mapping(data: &Arc<Mutex<Data>>, ctx: &Context, guilds: &
     for id in guilds {
         let name = id.name(&ctx.cache).await.unwrap();
         let tag = data.next_server_tag.to_string();
-        data.server_mapping
-            .insert(tag, name);
+        let channels: HashMap<String, ChannelId> = id
+            .to_guild_cached(ctx.cache.clone())
+            .await
+            .unwrap()
+            .channels
+            .into_iter()
+            .filter(|(_channel_id, channel)| channel.kind == ChannelType::Text)
+            .map(|(channel_id, channel)| (channel.name, channel_id))
+            .collect();
+        println!("Channels:\n{:#?}", channels);
+        let mut webhooks: HashMap<String, WebhookId> = HashMap::default();
+        for (name, id) in &channels {
+            let hooks = id
+                .to_channel(&ctx)
+                .await
+                .unwrap()
+                .guild()
+                .unwrap()
+                .webhooks(&ctx)
+                .await
+                .unwrap();
+            let mut found = false;
+            for hook in hooks {
+                if hook.name == Some("Analyst Bot".to_owned()) {
+                    hook.user;
+                    webhooks.insert(name.clone(), hook.id);
+                    found = true;
+                    break;
+                }
+            }
+            if found == false {
+                // Webhook for this channel doesn't exist so we create it.
+                let new_hook = id
+                    .to_channel(&ctx)
+                    .await
+                    .unwrap()
+                    .guild()
+                    .unwrap()
+                    .create_webhook(&ctx, WEBHOOK_NAME)
+                    .await
+                    .unwrap();
+                webhooks.insert(name.clone(), new_hook.id);
+            }
+        }
+        data.server_mapping.insert(
+            tag,
+            Server {
+                name: name,
+                id: *id,
+                channels: channels,
+                webhooks: webhooks,
+            },
+        );
         data.next_server_tag += 1;
     }
     println!("Finished server mapping\n{:#?}", data);
