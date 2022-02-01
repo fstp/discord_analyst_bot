@@ -27,7 +27,6 @@ struct Server {
     name: String,
     id: GuildId,
     channels: HashMap<String, ChannelId>,
-    webhooks: HashMap<String, WebhookId>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
@@ -42,13 +41,14 @@ struct TargetChannel {
     name: String,
     source_tag: String,
     server_tag: String,
+    channel_id: ChannelId,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct Data {
-    source_channels: HashMap<String, SourceChannel>,
+    source_channels: HashMap<ChannelId, SourceChannel>,
     target_channels: HashSet<TargetChannel>,
-    channel_mapping: HashMap<String, HashSet<String>>,
+    channel_mapping: HashMap<String, HashSet<ChannelId>>,
     server_mapping: HashMap<String, Server>,
     next_server_tag: usize,
 }
@@ -126,16 +126,26 @@ fn print_help() {
     style("help").cyan());
 }
 
-fn add_mapping(source_tag: String, target_name: String, data: &mut Data) {
+fn add_mapping(source_tag: String, target_channel_id: ChannelId, data: &mut Data) {
     // First check if the source tag already exists in the mapping.
     if data.channel_mapping.contains_key(&source_tag) {
-        let target_names = data.channel_mapping.get_mut(&source_tag).unwrap();
-        target_names.insert(target_name);
+        let target_channel_ids = data.channel_mapping.get_mut(&source_tag).unwrap();
+        target_channel_ids.insert(target_channel_id);
     } else {
         // This is the first occurence of source tag so create a new association.
         data.channel_mapping
-            .insert(source_tag, HashSet::from([target_name]));
+            .insert(source_tag, HashSet::from([target_channel_id]));
     }
+}
+
+fn get_channel_id(server_tag: &String, channel_name: &String, data: &Data) -> Option<ChannelId> {
+    let server: &Server = data.server_mapping.get(server_tag).unwrap();
+    for (name, id) in &server.channels {
+        if name == channel_name {
+            return Some(*id);
+        }
+    }
+    return None;
 }
 
 async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
@@ -180,14 +190,15 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
                 name: parts[2].to_owned(),
                 channel_tag: parts[3].to_owned(),
             };
-            let source_tag = source_channel.channel_tag.clone();
-            data.source_channels
-                .insert(source_tag.clone(), source_channel);
+            let source_tag = parts[3].to_owned();
+            let channel_id =
+                get_channel_id(&source_channel.server_tag, &source_channel.name, &data).unwrap();
+            data.source_channels.insert(channel_id, source_channel);
             // Reconnect any orphan target channels with this channel tag.
-            let mut mappings: Vec<(String, String)> = Vec::default();
+            let mut mappings: Vec<(String, ChannelId)> = Vec::default();
             for ch in &data.target_channels {
                 if &ch.source_tag == &source_tag {
-                    mappings.push((ch.source_tag.clone(), ch.name.clone()));
+                    mappings.push((ch.source_tag.clone(), ch.channel_id));
                 }
             }
             for m in mappings {
@@ -195,27 +206,36 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
             }
         }
         "target+" if parts.len() == 4 => {
+            let server_tag = parts[1].to_owned();
+            let name = parts[2].to_owned();
+            let source_tag = parts[3].to_owned();
+            let channel_id = get_channel_id(&server_tag, &name, &data).unwrap();
+
             let target_channel = TargetChannel {
-                server_tag: parts[1].to_owned(),
-                name: parts[2].to_owned(),
-                source_tag: parts[3].to_owned(),
+                server_tag: server_tag,
+                name: name,
+                source_tag: source_tag.clone(),
+                channel_id: channel_id,
             };
-            // Make sure we actually have a corresponding
-            // source channel with the tag.
-            if data
-                .source_channels
-                .contains_key(&target_channel.source_tag)
-            {
-                let source_tag = target_channel.source_tag.clone();
-                let target_tag = target_channel.name.clone();
-                data.target_channels.insert(target_channel);
-                add_mapping(source_tag, target_tag, &mut *data);
-            } else {
+
+            // Make sure we actually know about the source channel.
+            let mut found = false;
+            for (_ch_id, ch) in &data.source_channels {
+                if &ch.channel_tag == &target_channel.source_tag {
+                    let source_tag = target_channel.source_tag.clone();
+                    add_mapping(source_tag, target_channel.channel_id, &mut *data);
+                    data.target_channels.insert(target_channel);
+                    found = true;
+                    break;
+                }
+            }
+
+            if found == false {
                 // No source channel found.
                 println!(
                     "{}\nNo source channel found with the tag {}",
                     style("Error:").red(),
-                    target_channel.source_tag,
+                    source_tag,
                 );
             }
         }
@@ -226,19 +246,16 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
                 name: parts[2].to_owned(),
                 channel_tag: parts[3].to_owned(),
             };
-            match data.source_channels.remove(&source_channel.channel_tag) {
-                Some(_) => {
-                    // Source channel existed, now remove any mapping for it.
-                    data.channel_mapping.remove(&source_channel.channel_tag);
-                }
-                None => {
-                    // No such channel found, error.
-                    println!(
-                        "{}\nNo such source channel\n{:#?}",
-                        style("Error:").red(),
-                        source_channel,
-                    );
-                }
+            let mut iter = data.source_channels.drain_filter(|_ch_id, ch| {
+                return ch.channel_tag == source_channel.channel_tag;
+            });
+            if iter.next().is_some() == false {
+                // No channel was found/removed, error.
+                println!(
+                    "{}\nNo such source channel\n{:#?}",
+                    style("Error:").red(),
+                    source_channel,
+                );
             }
         }
         // "source-" if parts.len() == 2 => {
@@ -252,34 +269,34 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
         //         data.tag_mapping.remove(&ch.0);
         //     }
         // }
-        "status" => {
-            let mut table = Table::new();
-            let header = vec![
-                Cell::new("Source Channel").add_attribute(Attribute::Bold),
-                Cell::new("Target Channel(s)").add_attribute(Attribute::Bold),
-            ];
-            let mut rows: Vec<Vec<Cell>> = Vec::default();
-            for (tag, ch) in &data.source_channels {
-                // Only include source channel in the table if it has
-                // any targets mapped to it.
-                if data.channel_mapping.contains_key(tag) {
-                    let targets = data.channel_mapping.get(tag).unwrap().iter().format("\n");
-                    rows.push(vec![
-                        Cell::new(format!("{} [{}]", ch.name, ch.channel_tag)).fg(Color::Cyan),
-                        Cell::new(format!("{}", targets)).fg(Color::Cyan),
-                    ]);
-                }
-            }
-            table
-                .load_preset(UTF8_FULL)
-                .set_content_arrangement(ContentArrangement::Dynamic)
-                .set_table_width(80)
-                .set_header(header);
-            for row in rows {
-                table.add_row(row);
-            }
-            println!("{table}");
-        }
+        // "status" => {
+        //     let mut table = Table::new();
+        //     let header = vec![
+        //         Cell::new("Source Channel").add_attribute(Attribute::Bold),
+        //         Cell::new("Target Channel(s)").add_attribute(Attribute::Bold),
+        //     ];
+        //     let mut rows: Vec<Vec<Cell>> = Vec::default();
+        //     for (tag, ch) in &data.source_channels {
+        //         // Only include source channel in the table if it has
+        //         // any targets mapped to it.
+        //         if data.channel_mapping.contains_key(tag) {
+        //             let targets = data.channel_mapping.get(tag).unwrap().iter().format("\n");
+        //             rows.push(vec![
+        //                 Cell::new(format!("{} [{}]", ch.name, ch.channel_tag)).fg(Color::Cyan),
+        //                 Cell::new(format!("{}", targets)).fg(Color::Cyan),
+        //             ]);
+        //         }
+        //     }
+        //     table
+        //         .load_preset(UTF8_FULL)
+        //         .set_content_arrangement(ContentArrangement::Dynamic)
+        //         .set_table_width(80)
+        //         .set_header(header);
+        //     for row in rows {
+        //         table.add_row(row);
+        //     }
+        //     println!("{table}");
+        // }
         _ => {
             println!(
                 "{} Unrecognized command\n{:#?}",
@@ -289,6 +306,38 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
         }
     }
     return rsp;
+}
+
+async fn regenerate_webhooks(ctx: &Context, server: &Server) {
+    for (_name, id) in &server.channels {
+        let hooks = id
+            .to_channel(&ctx)
+            .await
+            .unwrap()
+            .guild()
+            .unwrap()
+            .webhooks(&ctx)
+            .await
+            .unwrap();
+        let mut found = false;
+        for hook in hooks {
+            if hook.name == Some(WEBHOOK_NAME.to_owned()) {
+                found = true;
+                break;
+            }
+        }
+        if found == false {
+            // Webhook for this channel doesn't exist so we create it.
+            id.to_channel(&ctx)
+                .await
+                .unwrap()
+                .guild()
+                .unwrap()
+                .create_webhook(&ctx, WEBHOOK_NAME)
+                .await
+                .unwrap();
+        }
+    }
 }
 
 async fn create_server_mapping(data: &Arc<Mutex<Data>>, ctx: &Context, guilds: &Vec<GuildId>) {
@@ -305,50 +354,13 @@ async fn create_server_mapping(data: &Arc<Mutex<Data>>, ctx: &Context, guilds: &
             .filter(|(_channel_id, channel)| channel.kind == ChannelType::Text)
             .map(|(channel_id, channel)| (channel.name, channel_id))
             .collect();
-        println!("Channels:\n{:#?}", channels);
-        let mut webhooks: HashMap<String, WebhookId> = HashMap::default();
-        for (name, id) in &channels {
-            let hooks = id
-                .to_channel(&ctx)
-                .await
-                .unwrap()
-                .guild()
-                .unwrap()
-                .webhooks(&ctx)
-                .await
-                .unwrap();
-            let mut found = false;
-            for hook in hooks {
-                if hook.name == Some("Analyst Bot".to_owned()) {
-                    hook.user;
-                    webhooks.insert(name.clone(), hook.id);
-                    found = true;
-                    break;
-                }
-            }
-            if found == false {
-                // Webhook for this channel doesn't exist so we create it.
-                let new_hook = id
-                    .to_channel(&ctx)
-                    .await
-                    .unwrap()
-                    .guild()
-                    .unwrap()
-                    .create_webhook(&ctx, WEBHOOK_NAME)
-                    .await
-                    .unwrap();
-                webhooks.insert(name.clone(), new_hook.id);
-            }
-        }
-        data.server_mapping.insert(
-            tag,
-            Server {
-                name: name,
-                id: *id,
-                channels: channels,
-                webhooks: webhooks,
-            },
-        );
+        let server = Server {
+            name: name,
+            id: *id,
+            channels: channels,
+        };
+        regenerate_webhooks(&ctx, &server).await;
+        data.server_mapping.insert(tag, server);
         data.next_server_tag += 1;
     }
     println!("Finished server mapping\n{:#?}", data);
@@ -366,26 +378,26 @@ impl EventHandler for Handler {
     //
     // Event handlers are dispatched through a threadpool, and so multiple
     // events can be dispatched simultaneously.
-    async fn message(&self, _ctx: Context, _msg: Message) {
-        // Sending a message can fail, due to a network error, an
-        // authentication error, or lack of permissions to post in the
-        // channel, so log to stdout when some error happens, with a
-        // description of it.
-        // let user = msg.author;
-        // if user.bot == false {
-        //     let guild_name = msg.guild_id.unwrap().name(ctx.cache).await.unwrap();
-        //     let str_msg = format!(
-        //         "{} said in {} ({}): {}",
-        //         user.mention(),
-        //         msg.channel_id.mention(),
-        //         guild_name,
-        //         msg.content,
-        //     );
-        //     if let Err(why) = msg.channel_id.say(&ctx.http, str_msg).await {
-        //         println!("Error sending message: {:?}", why);
-        //     }
-        // }
-    }
+    //async fn message(&self, _ctx: Context, _msg: Message) {
+    // Sending a message can fail, due to a network error, an
+    // authentication error, or lack of permissions to post in the
+    // channel, so log to stdout when some error happens, with a
+    // description of it.
+    // let user = msg.author;
+    // if user.bot == false {
+    //     let guild_name = msg.guild_id.unwrap().name(ctx.cache).await.unwrap();
+    //     let str_msg = format!(
+    //         "{} said in {} ({}): {}",
+    //         user.mention(),
+    //         msg.channel_id.mention(),
+    //         guild_name,
+    //         msg.content,
+    //     );
+    //     if let Err(why) = msg.channel_id.say(&ctx.http, str_msg).await {
+    //         println!("Error sending message: {:?}", why);
+    //     }
+    // }
+    //}
 
     // Set a handler to be called on the `ready` event. This is called when a
     // shard is booted, and a READY payload is sent by Discord. This payload
@@ -403,6 +415,12 @@ impl EventHandler for Handler {
             .send(true)
             .await
             .expect("Failed to send cache ready");
+    }
+
+    async fn message(&self, _ctx: Context, msg: Message) {
+        if msg.author.bot == false {
+            // Check if the channel received in is a source.
+        }
     }
 }
 
