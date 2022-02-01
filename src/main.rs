@@ -417,9 +417,53 @@ impl EventHandler for Handler {
             .expect("Failed to send cache ready");
     }
 
-    async fn message(&self, _ctx: Context, msg: Message) {
+    async fn message(&self, ctx: Context, msg: Message) {
         if msg.author.bot == false {
-            // Check if the channel received in is a source.
+            let data = self.data.lock().await;
+            match data.source_channels.get(&msg.channel_id) {
+                Some(source_channel) => {
+                    match data.channel_mapping.get(&source_channel.channel_tag) {
+                        Some(target_ids) => {
+                            for id in target_ids {
+                                let webhooks = id
+                                    .to_channel(&ctx)
+                                    .await
+                                    .unwrap()
+                                    .guild()
+                                    .unwrap()
+                                    .webhooks(&ctx)
+                                    .await
+                                    .unwrap();
+                                for hook in &webhooks {
+                                    match &hook.name {
+                                        Some(name) => {
+                                            if name == WEBHOOK_NAME {
+                                                // Found our webhook, execute it!
+                                                hook.execute(&ctx, false, |w| {
+                                                    w.content(&msg.content);
+                                                    w
+                                                }).await.unwrap();
+                                            }
+                                        }
+                                        None => {
+                                            // Couldn't get the name of the webhook,
+                                            // must not be ours then...
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            // No mapping (no targets) exist for this
+                            // source channel so we ignore the message.
+                        }
+                    }
+                }
+                None => {
+                    // Originating channel is not a source
+                    // so we ignore the message.
+                }
+            }
         }
     }
 }
