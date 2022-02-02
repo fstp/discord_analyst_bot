@@ -138,15 +138,45 @@ fn add_mapping(source_tag: String, target_channel_id: ChannelId, data: &mut Data
     }
 }
 
-fn get_channel_id(server_tag: &String, channel_name: &String, data: &Data) -> Option<ChannelId> {
-    let server: &Server = data.server_mapping.get(server_tag).unwrap();
+fn validate_server_tag<'a>(server_tag: &String, data: &'a Data) -> Option<&'a Server> {
+    return match data.server_mapping.get(server_tag) {
+        Some(server) => Some(server),
+        None => {
+            println!(
+                "{}\nNo server with the tag {} was found",
+                style("Error:").red(),
+                style(server_tag).cyan(),
+            );
+            None
+        }
+    };
+}
+
+fn validate_channel_name(channel_name: &String, server: &Server) -> Option<ChannelId> {
     for (name, id) in &server.channels {
         if name == channel_name {
             return Some(*id);
         }
     }
+    // If we get here then the channel was not found, error.
+    println!(
+        "{}\nNo channel with the name {} found in the server {}",
+        style("Error:").red(),
+        style(channel_name).cyan(),
+        style(&server.name).cyan(),
+    );
     return None;
 }
+
+// fn get_channel_id(server_tag: &String, channel_name: &String, data: &Data) -> Option<ChannelId> {
+//     let server: &Server = data.server_mapping.get(server_tag).unwrap();
+//     for (name, id) in &server.channels {
+//         if name == channel_name {
+//             return Some(*id);
+//         }
+//     }
+//     return None;
+// }
 
 async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
     let mut rsp = true;
@@ -171,7 +201,7 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
                     "{}\nFailed to read the file \"data.json\" (reason: {}) \
                     \nAre you sure it exists in the same directory as the bot?",
                     style("Error:").red(),
-                    why,
+                    style(why).cyan(),
                 )
             }
         },
@@ -185,59 +215,80 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
         //     data.server_mapping.insert(server_tag, server_name);
         // }
         "source+" if parts.len() == 4 => {
-            let source_channel = SourceChannel {
-                server_tag: parts[1].to_owned(),
-                name: parts[2].to_owned(),
-                channel_tag: parts[3].to_owned(),
+            let server_tag = parts[1].to_owned();
+            let name = parts[2].to_owned();
+            let channel_tag = parts[3].to_owned();
+
+            let server = match validate_server_tag(&server_tag, &data) {
+                Some(server) => server,
+                None => return rsp,
             };
-            let source_tag = parts[3].to_owned();
-            let channel_id =
-                get_channel_id(&source_channel.server_tag, &source_channel.name, &data).unwrap();
-            data.source_channels.insert(channel_id, source_channel);
-            // Reconnect any orphan target channels with this channel tag.
+
+            let channel_id = match validate_channel_name(&name, server) {
+                Some(channel_id) => channel_id,
+                None => return rsp,
+            };
+
+            // Reconnect any orphan target channels with this source channel tag.
             let mut mappings: Vec<(String, ChannelId)> = Vec::default();
             for ch in &data.target_channels {
-                if &ch.source_tag == &source_tag {
-                    mappings.push((ch.source_tag.clone(), ch.channel_id));
+                if &ch.source_tag == &channel_tag {
+                    mappings.push((channel_tag.clone(), ch.channel_id));
                 }
             }
             for m in mappings {
                 add_mapping(m.0, m.1, &mut *data);
             }
+
+            let source_channel = SourceChannel {
+                server_tag: server_tag,
+                name: name,
+                channel_tag: channel_tag,
+            };
+            data.source_channels.insert(channel_id, source_channel);
         }
         "target+" if parts.len() == 4 => {
             let server_tag = parts[1].to_owned();
             let name = parts[2].to_owned();
             let source_tag = parts[3].to_owned();
-            let channel_id = get_channel_id(&server_tag, &name, &data).unwrap();
 
-            let target_channel = TargetChannel {
-                server_tag: server_tag,
-                name: name,
-                source_tag: source_tag.clone(),
-                channel_id: channel_id,
+            let server = match validate_server_tag(&server_tag, &data) {
+                Some(server) => server,
+                None => return rsp,
             };
 
-            // Make sure we actually know about the source channel.
+            let channel_id = match validate_channel_name(&name, server) {
+                Some(channel_id) => channel_id,
+                None => return rsp,
+            };
+
+            // Make sure we actually know about the source channel (valid source tag).
             let mut found = false;
             for (_ch_id, ch) in &data.source_channels {
-                if &ch.channel_tag == &target_channel.source_tag {
-                    let source_tag = target_channel.source_tag.clone();
-                    add_mapping(source_tag, target_channel.channel_id, &mut *data);
-                    data.target_channels.insert(target_channel);
+                if &ch.channel_tag == &source_tag {
+                    add_mapping(source_tag.clone(), channel_id, &mut *data);
                     found = true;
                     break;
                 }
             }
 
             if found == false {
-                // No source channel found.
+                // No source channel found, error.
                 println!(
                     "{}\nNo source channel found with the tag {}",
                     style("Error:").red(),
-                    source_tag,
+                    style(source_tag).cyan(),
                 );
+                return rsp;
             }
+
+            let target_channel = TargetChannel {
+                server_tag: server_tag,
+                name: name,
+                source_tag: source_tag,
+                channel_id: channel_id,
+            };
+            data.target_channels.insert(target_channel);
         }
         "source-" if parts.len() == 4 => {
             // <channel-tag> is a parameter.
@@ -442,7 +493,9 @@ impl EventHandler for Handler {
                                                 hook.execute(&ctx, false, |w| {
                                                     w.content(&msg.content);
                                                     w
-                                                }).await.unwrap();
+                                                })
+                                                .await
+                                                .unwrap();
                                             }
                                         }
                                         None => {
@@ -520,7 +573,7 @@ async fn main() {
                 .with_prompt(">")
                 .default("help".into())
                 .interact_text()
-                .unwrap();
+                .unwrap_or("help".into());
             cli_tx.blocking_send(input).unwrap();
         }
     });
