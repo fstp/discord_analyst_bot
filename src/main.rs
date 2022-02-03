@@ -111,7 +111,7 @@ fn print_help() {
     style("Commands:").fg(SPRING_GREEN),
     style("server+").cyan(), style("<server-tag> name").green(),
     style("source+").cyan(), style("<server-tag> #channel <channel-tag>").green(),
-    style("source-").cyan(), style("<server-tag> #channel <channel-tag>").green(),
+    style("source-").cyan(), style("#channel <channel-tag>").green(),
     style("target+").cyan(), style("<server-tag> #channel <channel-tag>").green(),
     style("serverlist").cyan(),
     style("serverbanlist+").cyan(), style("<Server ID>").green(),
@@ -168,16 +168,6 @@ fn validate_channel_name(channel_name: &String, server: &Server) -> Option<Chann
     return None;
 }
 
-// fn get_channel_id(server_tag: &String, channel_name: &String, data: &Data) -> Option<ChannelId> {
-//     let server: &Server = data.server_mapping.get(server_tag).unwrap();
-//     for (name, id) in &server.channels {
-//         if name == channel_name {
-//             return Some(*id);
-//         }
-//     }
-//     return None;
-// }
-
 async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
     let mut rsp = true;
     let parts: Vec<&str> = msg.split_whitespace().collect();
@@ -186,16 +176,62 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
         "help" | "h" => print_help(),
         "quit" | "q" => rsp = false,
         "save" | "s" => {
-            let serialized = serde_json::to_string_pretty(&*data).unwrap();
-            let mut file = File::create("data.json").await.unwrap();
-            file.write_all(serialized.as_bytes()).await.unwrap();
-            println!("{}:\n{}", style("Serialized").cyan(), serialized);
+            let serialized = match serde_json::to_string_pretty(&*data) {
+                Ok(serialized) => serialized,
+                Err(why) => {
+                    println!(
+                        "{}\nFailed to serialize the data (reason: {})",
+                        style("Error").red(),
+                        style(why).cyan()
+                    );
+                    return rsp;
+                }
+            };
+            let mut file = match File::create("data.json").await {
+                Ok(file) => file,
+                Err(why) => {
+                    println!(
+                        "{}\nFailed to create the \"data.json\" file (reason: {}) \
+                        \nAre you sure that you have access rights to create/write files \
+                        \nin the bot directory?",
+                        style("Error").red(),
+                        style(why).cyan()
+                    );
+                    return rsp;
+                }
+            };
+            match file.write_all(serialized.as_bytes()).await {
+                Ok(_) => {
+                    println!("{}:\n{}", style("Serialized").cyan(), serialized);
+                }
+                Err(why) => {
+                    println!(
+                        "{}\nFailed to write to the \"data.json\" file (reason: {}) \
+                        \nAre you sure that you have access rights to create/write files \
+                        \nin the bot directory?",
+                        style("Error").red(),
+                        style(why).cyan()
+                    );
+                    return rsp;
+                }
+            };
         }
         "load" | "l" => match fs::read_to_string("data.json").await {
-            Ok(json) => {
-                *data = serde_json::from_str(&json).unwrap();
-                println!("{}:\n{:#?}", style("Deserialized").cyan(), data);
-            }
+            Ok(json) => match serde_json::from_str(&json) {
+                Ok(deserialized) => {
+                    println!("{}:\n{:#?}", style("Deserialized").cyan(), deserialized);
+                    *data = deserialized;
+                }
+                Err(why) => {
+                    println!(
+                        "{}\nFailed to deserialize the data from \"data.json\" file (reason: {}) \
+                            \nPerhaps something in the JSON structure is incorrect.",
+                        style("Error").red(),
+                        style(why).cyan()
+                    );
+                    return rsp;
+                }
+            },
             Err(why) => {
                 println!(
                     "{}\nFailed to read the file \"data.json\" (reason: {}) \
@@ -290,22 +326,21 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
             };
             data.target_channels.insert(target_channel);
         }
-        "source-" if parts.len() == 4 => {
-            // <channel-tag> is a parameter.
-            let source_channel = SourceChannel {
-                server_tag: parts[1].to_owned(),
-                name: parts[2].to_owned(),
-                channel_tag: parts[3].to_owned(),
-            };
+        // <channel-tag> is a parameter.
+        "source-" if parts.len() == 3 => {
+            let name = parts[2].to_owned();
+            let channel_tag = parts[3].to_owned();
+
             let mut iter = data.source_channels.drain_filter(|_ch_id, ch| {
-                return ch.channel_tag == source_channel.channel_tag;
+                return (&ch.channel_tag == &channel_tag) && (&ch.name == &name);
             });
+
             if iter.next().is_some() == false {
                 // No channel was found/removed, error.
                 println!(
-                    "{}\nNo such source channel\n{:#?}",
+                    "{}\nNo source channel with name {} was found",
                     style("Error:").red(),
-                    source_channel,
+                    style(&name).cyan(),
                 );
             }
         }
