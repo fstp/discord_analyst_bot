@@ -1,24 +1,87 @@
 #![feature(hash_drain_filter)]
 
-use comfy_table::presets::UTF8_FULL;
-use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use console::style;
 use dialoguer::Input;
 use itertools::Itertools;
+use rillrate::prime::{
+    table::{Col, Row},
+    *,
+};
 use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
+    client::bridge::gateway::{ShardId, ShardManager},
+    framework::standard::{
+        macros::{command, group, hook},
+        CommandResult, StandardFramework,
+    },
     model::channel::{ChannelType, Message},
     model::gateway::Ready,
     model::id::{ChannelId, GuildId, WebhookId},
     prelude::*,
 };
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::thread;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{atomic::*, Arc},
+    time::{Instant, Duration},
+    thread,
+};
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+
+// Name used to group dashboards.
+// You could have multiple packages for different applications, such as a package for the bot
+// dashboards, and another package for a web server running alongside the bot.
+const PACKAGE: &str = "Bot Dashboards";
+// Dashboards are a part inside of package, they can be used to group different types of
+// dashboards that you may want to use, like a dashboard for system status, another dashboard
+// for cache status, and another one to configure features or trigger actions on the bot.
+const DASHBOARD_STATS: &str = "Statistics";
+const DASHBOARD_CONFIG: &str = "Config Dashboard";
+// This are collapsable menus inside the dashboard, you can use them to group specific sets
+// of data inside the same dashboard.
+// If you are using constants for this, make sure they don't end in _GROUP or _COMMAND, because
+// serenity's command framework uses these internally.
+const GROUP_LATENCY: &str = "1 - Discord Latency";
+const GROUP_COMMAND_COUNT: &str = "2 - Command Trigger Count";
+const GROUP_CONF: &str = "1 - Switch Command Configuration";
+// All of the 3 configurable namescapes are sorted alphabetically.
+
+#[derive(Debug, Clone)]
+struct CommandUsageValue {
+    index: usize,
+    use_count: usize,
+}
+
+struct Components {
+    data_switch: AtomicBool,
+    double_link_value: AtomicU8,
+    ws_ping_history: Pulse,
+    get_ping_history: Pulse,
+    #[cfg(feature = "post-ping")]
+    post_ping_history: Pulse,
+    command_usage_table: Table,
+    command_usage_values: Mutex<HashMap<&'static str, CommandUsageValue>>,
+}
+
+struct RillRateComponents;
+
+impl TypeMapKey for RillRateComponents {
+    // RillRate element types have internal mutability, so we don't need RwLock nor Mutex!
+    // We do still want to Arc the type so it can be cloned out of `ctx.data`.
+    // If you wanna bind data between RillRate and the bot that doesn't have Atomics, use fields
+    // that use RwLock or Mutex, rather than making the enirety of Components one of them, like
+    // it's being done with `command_usage_values` this will make it considerably less likely
+    // to deadlock.
+    type Value = Arc<Components>;
+}
+
+struct ShardManagerContainer;
+
+impl TypeMapKey for ShardManagerContainer {
+    type Value = Arc<Mutex<ShardManager>>;
+}
 
 const WEBHOOK_NAME: &str = "Analyst Bot (QkTdmq49PE)";
 
@@ -452,6 +515,205 @@ async fn create_server_mapping(data: &Arc<Mutex<Data>>, ctx: &Context, guilds: &
     println!("Finished server mapping\n{:#?}", data);
 }
 
+async fn initiate_rillrate(ctx: Context) {
+    let switch = Switch::new(
+        [PACKAGE, DASHBOARD_CONFIG, GROUP_CONF, "Toggle Switch"],
+        SwitchOpts::default().label("Switch Me and run the `~switch` command!"),
+    );
+    let switch_instance = switch.clone();
+
+    let ctx_clone = ctx.clone();
+
+    tokio::spawn(async move {
+        // There's currently no way to read the current data stored on RillRate types,
+        // so we use our own external method of storage, in this case since a switch is
+        // essentially just a boolean, we use an AtomicBool, stored on the same
+        // Components structure.
+        let elements = {
+            let data_read = ctx_clone.data.read().await;
+            data_read.get::<RillRateComponents>().unwrap().clone()
+        };
+
+        switch.sync_callback(move |envelope| {
+            if let Some(action) = envelope.action {
+                println!("Switch action: {:?}", action);
+
+                // Here we toggle our internal state for the switch.
+                elements.data_switch.swap(action, Ordering::Relaxed);
+
+                // If you click the switch, it won't turn on by itself, it will just send an
+                // event about it's new status.
+                // We need to manually set the switch to that status.
+                // If we do it at the end, we can make sure the switch switches it's status
+                // only if the action was successful.
+                switch_instance.apply(action);
+            }
+
+            Ok(())
+        });
+    });
+
+    let default_values = {
+        let mut values = vec![];
+        for i in u8::MIN..=u8::MAX {
+            if i % 32 == 0 {
+                values.push(i.to_string())
+            }
+        }
+        values
+    };
+
+    // You are also able to have different actions in different elements interact with
+    // the same data.
+    // In this example, we have a Selector with preset data, and a Slider for more fine
+    // grain control of the value.
+    let selector = Selector::new(
+        [PACKAGE, DASHBOARD_CONFIG, GROUP_CONF, "Value Selector"],
+        SelectorOpts::default()
+            .label("Select from a preset of values!")
+            .options(default_values),
+    );
+    let selector_instance = selector.clone();
+
+    let slider = Slider::new(
+        [PACKAGE, DASHBOARD_CONFIG, GROUP_CONF, "Value Slider"],
+        SliderOpts::default()
+            .label("Or slide me for more fine grain control!")
+            .min(u8::MIN as f64)
+            .max(u8::MAX as f64)
+            .step(2),
+    );
+    let slider_instance = slider.clone();
+
+    let ctx_clone = ctx.clone();
+
+    tokio::spawn(async move {
+        let elements = {
+            let data_read = ctx_clone.data.read().await;
+            data_read.get::<RillRateComponents>().unwrap().clone()
+        };
+
+        selector.sync_callback(move |envelope| {
+            let mut value: Option<u8> = None;
+
+            if let Some(action) = envelope.action {
+                println!("Values action (selector): {:?}", action);
+                value = action.map(|val| val.parse().unwrap());
+            }
+
+            if let Some(val) = value {
+                elements.double_link_value.swap(val, Ordering::Relaxed);
+
+                // This is the selector callback, yet we are switching the data from the
+                // slider, this is to make sure both fields share the same look in the
+                // dashboard.
+                slider_instance.apply(val as f64);
+            }
+
+            // the sync_callback() closure wants a Result value returned.
+            Ok(())
+        });
+    });
+
+    let ctx_clone = ctx.clone();
+
+    tokio::spawn(async move {
+        let elements = {
+            let data_read = ctx_clone.data.read().await;
+            data_read.get::<RillRateComponents>().unwrap().clone()
+        };
+
+        // Because sync_callback() waits for an action to happen to it's element,
+        // we cannot have both in the same thread, rather we need to listen to them in
+        // parallel, but still have both modify the same value in the end.
+        slider.sync_callback(move |envelope| {
+            let mut value: Option<u8> = None;
+
+            if let Some(action) = envelope.action {
+                println!("Values action (slider): {:?}", action);
+                value = Some(action as u8);
+            }
+
+            if let Some(val) = value {
+                elements.double_link_value.swap(val, Ordering::Relaxed);
+
+                selector_instance.apply(Some(val.to_string()));
+            }
+
+            Ok(())
+        });
+    });
+
+    let ctx_clone = ctx.clone();
+
+    tokio::spawn(async move {
+        let elements = {
+            let data_read = ctx_clone.data.read().await;
+            data_read.get::<RillRateComponents>().unwrap().clone()
+        };
+
+        loop {
+            // Get the REST GET latency by counting how long it takes to do a GET request.
+            let get_latency = {
+                let now = Instant::now();
+                // `let _` to supress any errors. If they are a timeout, that will  be
+                // reflected in the plotted graph.
+                let _ = reqwest::get("https://discordapp.com/api/v6/gateway").await;
+                now.elapsed().as_millis() as f64
+            };
+
+            // POST Request is feature gated because discord doesn't like bots doing repeated
+            // tasks in short time periods, as they are considered API abuse; this is specially
+            // true on bigger bots. If you still wanna see this function though, compile the
+            // code adding `--features post-ping` to the command.
+            //
+            // Get the REST POST latency by posting a message to #testing.
+            //
+            // If you don't want to spam, use the DM channel of some random bot, or use some
+            // other kind of POST request such as reacting to a message, or creating an invite.
+            // Be aware that if the http request fails, the latency returned may be incorrect.
+            #[cfg(feature = "post-ping")]
+            let post_latency = {
+                let now = Instant::now();
+                let _ = ChannelId(381926291785383946)
+                    .say(&ctx_clone, "Latency Test")
+                    .await;
+                now.elapsed().as_millis() as f64
+            };
+
+            // Get the Gateway Heartbeat latency.
+            // See example 5 for more information about the ShardManager latency.
+            let ws_latency = {
+                let data_read = ctx.data.read().await;
+                let shard_manager = data_read.get::<ShardManagerContainer>().unwrap();
+
+                let manager = shard_manager.lock().await;
+                let runners = manager.runners.lock().await;
+
+                let runner = runners.get(&ShardId(ctx.shard_id)).unwrap();
+
+                if let Some(duration) = runner.latency {
+                    duration.as_millis() as f64
+                } else {
+                    f64::NAN // effectively 0.0ms, it won't display on the graph.
+                }
+            };
+
+            elements.ws_ping_history.push(ws_latency);
+            elements.get_ping_history.push(get_latency);
+            #[cfg(feature = "post-ping")]
+            elements.post_ping_history.push(post_latency);
+
+            // Update every heartbeat, when the ws latency also updates.
+            tokio::time::sleep(Duration::from_millis(42500)).await;
+        }
+    });
+}
+
+#[group]
+#[commands(ping, switch)]
+struct General;
+
 struct Handler {
     data: Arc<Mutex<Data>>,
     cache_rdy_tx: tokio::sync::mpsc::Sender<bool>,
@@ -497,6 +759,7 @@ impl EventHandler for Handler {
 
     async fn cache_ready(&self, ctx: Context, guilds: Vec<GuildId>) {
         create_server_mapping(&self.data, &ctx, &guilds).await;
+        initiate_rillrate(ctx).await;
         self.cache_rdy_tx
             .send(true)
             .await
@@ -554,6 +817,31 @@ impl EventHandler for Handler {
             }
         }
     }
+}
+
+
+#[hook]
+async fn before_hook(ctx: &Context, _: &Message, cmd_name: &str) -> bool {
+    let elements = {
+        let data_read = ctx.data.read().await;
+        data_read.get::<RillRateComponents>().unwrap().clone()
+    };
+
+    let command_count_value = {
+        let mut count_write = elements.command_usage_values.lock().await;
+        let mut command_count_value = count_write.get_mut(cmd_name).unwrap();
+        command_count_value.use_count += 1;
+        command_count_value.clone()
+    };
+
+    elements.command_usage_table.set_cell(
+        Row(command_count_value.index as u64),
+        Col(1),
+        command_count_value.use_count,
+    );
+
+    println!("Running command {}", cmd_name);
+    true
 }
 
 #[tokio::main]
