@@ -819,7 +819,6 @@ impl EventHandler for Handler {
     }
 }
 
-
 #[hook]
 async fn before_hook(ctx: &Context, _: &Message, cmd_name: &str) -> bool {
     let elements = {
@@ -864,13 +863,128 @@ async fn main() {
         }
     };
 
+    // Start a server on `http://0.0.0.0:6361/`
+    // Currently the port is not configurable, but it will be soon enough; thankfully it's not a
+    // common port, so it will be fine for most users.
+    rillrate::install("serenity").unwrap();
+
+    // Because you probably ran this without looking at the source :P
+    webbrowser::open("http://localhost:6361").unwrap();
+
+    let framework = StandardFramework::new()
+        .configure(|c| c.prefix("~"))
+        .before(before_hook)
+        .group(&GENERAL_GROUP);
+
+    // These 3 Pulse are the graphs used to plot the latency overtime.
+    let ws_ping_tracer = Pulse::new(
+        [
+            PACKAGE,
+            DASHBOARD_STATS,
+            GROUP_LATENCY,
+            "Websocket Ping Time",
+        ],
+        Default::default(),
+        PulseOpts::default()
+            // The seconds of data to retain, this is 30 minutes.
+            .retain(1800_u32)
+            // Column value range
+            .min(0)
+            .max(200)
+            // Label used along the values on the column.
+            .suffix("ms".to_string())
+            .divisor(1.0),
+    );
+
+    let get_ping_tracer = Pulse::new(
+        [
+            PACKAGE,
+            DASHBOARD_STATS,
+            GROUP_LATENCY,
+            "Rest GET Ping Time",
+        ],
+        Default::default(),
+        PulseOpts::default()
+            .retain(1800_u32)
+            .min(0)
+            .max(200)
+            .suffix("ms".to_string())
+            .divisor(1.0),
+    );
+
+    #[cfg(feature = "post-ping")]
+    let post_ping_tracer = Pulse::new(
+        [
+            PACKAGE,
+            DASHBOARD_STATS,
+            GROUP_LATENCY,
+            "Rest POST Ping Time",
+        ],
+        Default::default(),
+        PulseOpts::default()
+            .retain(1800_u32)
+            .min(0)
+            // Post latency is on average higher, so we increase the max value on the graph.
+            .max(500)
+            .suffix("ms".to_string())
+            .divisor(1.0),
+    );
+
+    let command_usage_table = Table::new(
+        [
+            PACKAGE,
+            DASHBOARD_STATS,
+            GROUP_COMMAND_COUNT,
+            "Command Usage",
+        ],
+        Default::default(),
+        TableOpts::default().columns(vec![
+            (0, "Command Name".to_string()),
+            (1, "Number of Uses".to_string()),
+        ]),
+    );
+
+    let mut command_usage_values = HashMap::new();
+
+    // Iterate over the commands of the General grop and add them to the table.
+    for (idx, i) in GENERAL_GROUP.options.commands.iter().enumerate() {
+        command_usage_table.add_row(Row(idx as u64));
+        command_usage_table.set_cell(Row(idx as u64), Col(0), i.options.names[0]);
+        command_usage_table.set_cell(Row(idx as u64), Col(1), 0);
+        command_usage_values.insert(
+            i.options.names[0],
+            CommandUsageValue {
+                index: idx,
+                use_count: 0,
+            },
+        );
+    }
+
+    let components = Arc::new(Components {
+        ws_ping_history: ws_ping_tracer,
+        get_ping_history: get_ping_tracer,
+        #[cfg(feature = "post-ping")]
+        post_ping_history: post_ping_tracer,
+        data_switch: AtomicBool::new(false),
+        double_link_value: AtomicU8::new(0),
+        command_usage_table,
+        command_usage_values: Mutex::new(command_usage_values),
+    });
+
     let mut client = Client::builder(&discord_token)
         .event_handler(Handler {
             data: data.clone(),
             cache_rdy_tx: cache_rdy_tx,
         })
+        .framework(framework)
+        .type_map_insert::<RillRateComponents>(components)
         .await
         .expect("Error creating Discord client");
+
+    {
+        let mut data = client.data.write().await;
+        data.insert::<ShardManagerContainer>(Arc::clone(&client.shard_manager));
+    }
 
     tokio::spawn(async move {
         if let Err(why) = client.start().await {
@@ -920,6 +1034,56 @@ async fn main() {
         }
     }
     cli_handle.join().unwrap();
+}
+
+/// You can use this command to read the current value of the Switch, Slider and Selector.
+#[command]
+async fn switch(ctx: &Context, msg: &Message) -> CommandResult {
+    let elements = {
+        let data_read = ctx.data.read().await;
+        data_read.get::<RillRateComponents>().unwrap().clone()
+    };
+
+    msg.reply(
+        ctx,
+        format!(
+            "The switch is {} and the current value is {}",
+            if elements.data_switch.load(Ordering::Relaxed) {
+                "ON"
+            } else {
+                "OFF"
+            },
+            elements.double_link_value.load(Ordering::Relaxed),
+        ),
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[command]
+#[aliases("latency", "pong")]
+async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
+    let latency = {
+        let data_read = ctx.data.read().await;
+        let shard_manager = data_read.get::<ShardManagerContainer>().unwrap();
+
+        let manager = shard_manager.lock().await;
+        let runners = manager.runners.lock().await;
+
+        let runner = runners.get(&ShardId(ctx.shard_id)).unwrap();
+
+        if let Some(duration) = runner.latency {
+            format!("{:.2}ms", duration.as_millis())
+        } else {
+            "?ms".to_string()
+        }
+    };
+
+    msg.reply(ctx, &format!("The shard latency is {}", latency))
+        .await?;
+
+    Ok(())
 }
 
 // let listener = TcpListener::bind("localhost:8080").await.unwrap();
