@@ -1,8 +1,10 @@
 #![feature(hash_drain_filter)]
+#![feature(io_error_other)]
 
 use console::style;
 use dialoguer::Input;
 use itertools::Itertools;
+use regex::Regex;
 use rillrate::prime::{
     table::{Col, Row},
     *,
@@ -16,7 +18,7 @@ use serenity::{
         CommandResult, StandardFramework,
     },
     model::{
-        channel::{ChannelType, Message},
+        channel::{ChannelType, GuildChannel, Message},
         gateway::Ready,
         id::{ChannelId, GuildId, WebhookId},
         interactions::{
@@ -29,6 +31,7 @@ use serenity::{
     },
     prelude::*,
 };
+use sqlx::SqlitePool;
 use std::{
     collections::{HashMap, HashSet},
     sync::{atomic::*, Arc},
@@ -498,33 +501,65 @@ async fn regenerate_webhooks(ctx: &Context, server: &Server) {
     }
 }
 
-async fn create_server_mapping(data: &Arc<Mutex<Data>>, ctx: &Context, guilds: &Vec<GuildId>) {
-    let mut data = data.lock().await;
+async fn create_server_mapping(db: &SqlitePool, ctx: &Context, guilds: &Vec<GuildId>) {
+    // for id in guilds {
+    //     let name = id.name(&ctx.cache).await.unwrap();
+    //     let tag = data.next_server_tag.to_string();
+    //     let channels: HashMap<String, ChannelId> = id
+    //         .to_guild_cached(ctx.cache.clone())
+    //         .await
+    //         .unwrap()
+    //         .channels
+    //         .into_iter()
+    //         .filter(|(_channel_id, channel)| channel.kind == ChannelType::Text)
+    //         .map(|(channel_id, channel)| (channel.name, channel_id))
+    //         .collect();
+    //     let server = Server {
+    //         name: name,
+    //         id: *id,
+    //         channels: channels,
+    //     };
+    //     regenerate_webhooks(&ctx, &server).await;
+    //     data.server_mapping.insert(tag, server);
+    //     data.next_server_tag += 1;
+    // }
     for id in guilds {
-        let name = id.name(&ctx.cache).await.unwrap();
-        let tag = data.next_server_tag.to_string();
-        let channels: HashMap<String, ChannelId> = id
-            .to_guild_cached(ctx.cache.clone())
+        let guild_id = id.0 as i64;
+        let name = id.name(&ctx).await.unwrap();
+        sqlx::query!(
+            "INSERT OR REPLACE INTO Guilds (id, name) VALUES (?, ?)",
+            guild_id,
+            name,
+        )
+        .execute(db)
+        .await
+        .unwrap();
+
+        let channels: Vec<(ChannelId, GuildChannel)> = id
+            .channels(&ctx)
             .await
             .unwrap()
-            .channels
             .into_iter()
-            .filter(|(_channel_id, channel)| channel.kind == ChannelType::Text)
-            .map(|(channel_id, channel)| (channel.name, channel_id))
             .collect();
-        let server = Server {
-            name: name,
-            id: *id,
-            channels: channels,
-        };
-        regenerate_webhooks(&ctx, &server).await;
-        data.server_mapping.insert(tag, server);
-        data.next_server_tag += 1;
+        for (ch_id, ch) in channels {
+            if ch.kind == ChannelType::Text {
+                let channel_id = ch_id.0 as i64;
+                let name = ch.name;
+                sqlx::query!(
+                    "INSERT OR REPLACE INTO Channels (id, name, guild_id) VALUES (?, ?, ?)",
+                    channel_id,
+                    name,
+                    guild_id,
+                )
+                .execute(db)
+                .await
+                .unwrap();
+            }
+        }
     }
-    println!("Finished server mapping\n{:#?}", data);
 }
 
-async fn initiate_rillrate(ctx: Context) {
+async fn initiate_rillrate(db: &SqlitePool, ctx: Context) {
     let switch = Switch::new(
         [PACKAGE, DASHBOARD_CONFIG, GROUP_CONF, "Toggle Switch"],
         SwitchOpts::default().label("Switch Me and run the `~switch` command!"),
@@ -725,6 +760,7 @@ struct General;
 
 struct Handler {
     data: Arc<Mutex<Data>>,
+    db: SqlitePool,
     cache_rdy_tx: tokio::sync::mpsc::Sender<bool>,
 }
 
@@ -779,7 +815,7 @@ impl EventHandler for Handler {
                             option
                                 .name("id")
                                 .description("The user to lookup")
-                                .kind(ApplicationCommandOptionType::User)
+                                .kind(ApplicationCommandOptionType::String)
                                 .required(true)
                         })
                 })
@@ -861,8 +897,8 @@ impl EventHandler for Handler {
     }
 
     async fn cache_ready(&self, ctx: Context, guilds: Vec<GuildId>) {
-        create_server_mapping(&self.data, &ctx, &guilds).await;
-        initiate_rillrate(ctx).await;
+        create_server_mapping(&self.db, &ctx, &guilds).await;
+        initiate_rillrate(&self.db, &ctx).await;
         self.cache_rdy_tx
             .send(true)
             .await
@@ -984,17 +1020,55 @@ async fn before_hook(ctx: &Context, _: &Message, cmd_name: &str) -> bool {
     true
 }
 
+async fn initiate_database_connection() -> Option<SqlitePool> {
+    let content = match tokio::fs::read_to_string(".env").await {
+        Ok(db_name) => db_name,
+        Err(err) => {
+            println!(
+                "\n{}\nCould not read the \".env\" file, make sure a file with this name\n\
+                exists in the same directory as the bot (err: {})",
+                style("Error:").red(),
+                style(&err).cyan()
+            );
+            return None;
+        }
+    };
+    let re = Regex::new(r"DATABASE_URL=sqlite:(?P<filename>.*)").unwrap();
+    let db_name = match re.captures(&content) {
+        Some(caps) => caps["filename"].trim().to_owned(),
+        None => {
+            println!(
+                "\n{}\nCould not find the DB name in the \".env\" file, make sure it is one line\n\
+                that says \"DATABASE_URL=sqlite:data.db\" or some other name for the DB file\n\
+                (content: {})",
+                style("Error:").red(),
+                style(&content).cyan()
+            );
+            return None;
+        }
+    };
+    return Some(
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(db_name))
+            .await
+            .unwrap(),
+    );
+}
+
 #[tokio::main]
 async fn main() {
     let data: Arc<Mutex<Data>> = Arc::new(Mutex::new(Data::default()));
     let (cache_rdy_tx, mut cache_rdy_rx) = tokio::sync::mpsc::channel::<bool>(1);
 
     let discord_token = match tokio::fs::read_to_string("token.txt").await {
-        Err(_) => {
+        Err(err) => {
             println!(
-                "Could not read the authentication token from \"token.txt\"\n \
-                Make sure that the file exists and is located in the same\n \
-                directory as the bot executable"
+                "\n{}\nCould not read the authentication token from \"token.txt\"\n\
+                Make sure that the file exists and is located in the same\n\
+                directory as the bot executable (err: {})",
+                style("Error:").red(),
+                style(err).cyan()
             );
             return;
         }
@@ -1004,16 +1078,20 @@ async fn main() {
         }
     };
 
+    let db = match initiate_database_connection().await {
+        Some(db) => db,
+        None => return,
+    };
+
     // Start a server on `http://0.0.0.0:6361/`
     // Currently the port is not configurable, but it will be soon enough; thankfully it's not a
     // common port, so it will be fine for most users.
     rillrate::install("serenity").unwrap();
 
-    // Because you probably ran this without looking at the source :P
-    webbrowser::open("http://localhost:6361").unwrap();
+    //webbrowser::open("http://localhost:6361").unwrap();
 
     let framework = StandardFramework::new()
-        .configure(|c| c.prefix("~"))
+        .configure(|c| c.prefix("$"))
         .before(before_hook)
         .group(&GENERAL_GROUP);
 
@@ -1080,8 +1158,8 @@ async fn main() {
         ],
         Default::default(),
         TableOpts::default().columns(vec![
-            (0, "Command Name".to_string()),
-            (1, "Number of Uses".to_string()),
+            (0, "Server Id".to_string()),
+            (1, "Server Name".to_string()),
         ]),
     );
 
@@ -1118,7 +1196,8 @@ async fn main() {
     let mut client = Client::builder(&discord_token)
         .event_handler(Handler {
             data: data.clone(),
-            cache_rdy_tx: cache_rdy_tx,
+            db,
+            cache_rdy_tx,
         })
         .application_id(application_id)
         .framework(framework)
