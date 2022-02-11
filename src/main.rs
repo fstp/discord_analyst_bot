@@ -23,9 +23,11 @@ use serenity::{
         id::{ChannelId, GuildId, WebhookId},
         interactions::{
             application_command::{
-                ApplicationCommand, ApplicationCommandInteractionDataOptionValue,
-                ApplicationCommandOptionType,
+                ApplicationCommand, ApplicationCommandInteraction,
+                ApplicationCommandInteractionDataOption,
+                ApplicationCommandInteractionDataOptionValue, ApplicationCommandOptionType,
             },
+            autocomplete::{self, AutocompleteInteraction},
             Interaction, InteractionResponseType,
         },
     },
@@ -33,11 +35,13 @@ use serenity::{
 };
 use sqlx::SqlitePool;
 use std::{
+    cmp,
     collections::{HashMap, HashSet},
     sync::{atomic::*, Arc},
     thread,
     time::{Duration, Instant},
 };
+use sublime_fuzzy::best_match;
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -535,12 +539,8 @@ async fn create_server_mapping(db: &SqlitePool, ctx: &Context, guilds: &Vec<Guil
         .await
         .unwrap();
 
-        let channels: Vec<(ChannelId, GuildChannel)> = id
-            .channels(&ctx)
-            .await
-            .unwrap()
-            .into_iter()
-            .collect();
+        let channels: Vec<(ChannelId, GuildChannel)> =
+            id.channels(&ctx).await.unwrap().into_iter().collect();
         for (ch_id, ch) in channels {
             if ch.kind == ChannelType::Text {
                 let channel_id = ch_id.0 as i64;
@@ -557,6 +557,16 @@ async fn create_server_mapping(db: &SqlitePool, ctx: &Context, guilds: &Vec<Guil
             }
         }
     }
+}
+
+async fn get_server_names(db: &SqlitePool) -> Vec<String> {
+    sqlx::query!("SELECT Guilds.name FROM Guilds")
+        .fetch_all(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.name)
+        .collect()
 }
 
 async fn initiate_rillrate(db: &SqlitePool, ctx: Context) {
@@ -597,25 +607,31 @@ async fn initiate_rillrate(db: &SqlitePool, ctx: Context) {
         });
     });
 
-    let default_values = {
-        let mut values = vec![];
-        for i in u8::MIN..=u8::MAX {
-            if i % 32 == 0 {
-                values.push(i.to_string())
-            }
-        }
-        values
-    };
+    // let default_values = {
+    //     let mut values = vec![];
+    //     for i in u8::MIN..=u8::MAX {
+    //         if i % 32 == 0 {
+    //             values.push(i.to_string())
+    //         }
+    //     }
+    //     values
+    // };
+    let servers = get_server_names(db).await;
 
     // You are also able to have different actions in different elements interact with
     // the same data.
     // In this example, we have a Selector with preset data, and a Slider for more fine
     // grain control of the value.
     let selector = Selector::new(
-        [PACKAGE, DASHBOARD_CONFIG, GROUP_CONF, "Value Selector"],
+        [
+            PACKAGE,
+            DASHBOARD_CONFIG,
+            GROUP_CONF,
+            "[Source] Server Selector",
+        ],
         SelectorOpts::default()
             .label("Select from a preset of values!")
-            .options(default_values),
+            .options(servers),
     );
     let selector_instance = selector.clone();
 
@@ -681,7 +697,9 @@ async fn initiate_rillrate(db: &SqlitePool, ctx: Context) {
             if let Some(val) = value {
                 elements.double_link_value.swap(val, Ordering::Relaxed);
 
-                selector_instance.apply(Some(val.to_string()));
+                let dummy = vec!["Test1", "Test2", "Test3"];
+
+                //selector_instance.apply(Some(val.to_string()));
             }
 
             Ok(())
@@ -809,14 +827,31 @@ impl EventHandler for Handler {
                 })
                 .create_application_command(|command| {
                     command
-                        .name("id")
-                        .description("Get a user id")
+                        .name("connect")
+                        .description("Connect a source channel to a target channel")
                         .create_option(|option| {
                             option
-                                .name("id")
-                                .description("The user to lookup")
+                                .name("source")
+                                .description("Source channel")
+                                .kind(ApplicationCommandOptionType::Channel)
+                                .required(true)
+                            //.set_autocomplete(true)
+                        })
+                        .create_option(|option| {
+                            option
+                                .name("target_server")
+                                .description("Target server")
                                 .kind(ApplicationCommandOptionType::String)
                                 .required(true)
+                                .set_autocomplete(true)
+                        })
+                        .create_option(|option| {
+                            option
+                                .name("target_channel")
+                                .description("Target channel")
+                                .kind(ApplicationCommandOptionType::String)
+                                .required(true)
+                                .set_autocomplete(true)
                         })
                 })
                 .create_application_command(|command| {
@@ -898,7 +933,7 @@ impl EventHandler for Handler {
 
     async fn cache_ready(&self, ctx: Context, guilds: Vec<GuildId>) {
         create_server_mapping(&self.db, &ctx, &guilds).await;
-        initiate_rillrate(&self.db, &ctx).await;
+        initiate_rillrate(&self.db, ctx).await;
         self.cache_rdy_tx
             .send(true)
             .await
@@ -958,42 +993,319 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::ApplicationCommand(command) = interaction {
-            let content = match command.data.name.as_str() {
-                "ping" => "Hey, I'm alive!".to_string(),
-                "id" => {
-                    let options = command
-                        .data
-                        .options
-                        .get(0)
-                        .expect("Expected user option")
-                        .resolved
-                        .as_ref()
-                        .expect("Expected user object");
-
-                    if let ApplicationCommandInteractionDataOptionValue::User(user, _member) =
-                        options
-                    {
-                        format!("{}'s id is {}", user.tag(), user.id)
-                    } else {
-                        "Please provide a valid user".to_string()
-                    }
-                }
-                _ => "not implemented :(".to_string(),
-            };
-
-            if let Err(why) = command
-                .create_interaction_response(&ctx.http, |response| {
-                    response
-                        .kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|message| message.content(content))
-                })
-                .await
-            {
-                println!("Cannot respond to slash command: {}", why);
+        match interaction {
+            Interaction::ApplicationCommand(command) => {
+                handle_application_command(command, ctx).await
             }
+            Interaction::Autocomplete(autocomplete) => handle_autocomplete(autocomplete, ctx).await,
+            _ => println!("Received unknown interaction: {:#?}", interaction),
         }
     }
+}
+
+fn get_dummy_channels(server_name: &String) -> Vec<String> {
+    match server_name.as_str() {
+        "Discord Analyst Bot Test Server" => {
+            vec![
+                "#general".to_owned(),
+                "#source".to_owned(),
+                "#target1".to_owned(),
+                "#target2".to_owned(),
+            ]
+        }
+        "R2R Analytics" => {
+            vec![
+                "#test-source-1".to_owned(),
+                "#test-source-2".to_owned(),
+                "#test-target-1".to_owned(),
+                "#test-target-2".to_owned(),
+            ]
+        }
+        "Boll är fet" => {
+            vec![
+                "#general".to_owned(),
+                "#Boll är fet".to_owned(),
+                "#Väntar på John".to_owned(),
+                "#Birkenstock".to_owned(),
+                "#Väntar på Marie".to_owned(),
+            ]
+        }
+        "Djikscord" => {
+            vec!["#general".to_owned(), "#music-bot-stfu-el".to_owned()]
+        }
+        _ => {
+            vec![]
+        }
+    }
+}
+
+async fn send_empty_response(autocomplete: &AutocompleteInteraction, ctx: Context) {
+    autocomplete
+        .create_autocomplete_response(&ctx, move |rsp| rsp)
+        .await
+        .unwrap()
+}
+
+async fn connect_target_channel_autocomplete(
+    server_name: &String,
+    opt: &ApplicationCommandInteractionDataOption,
+    autocomplete: &AutocompleteInteraction,
+    ctx: Context,
+) {
+    if server_name.trim().is_empty() {
+        send_empty_response(autocomplete, ctx).await;
+        return;
+    }
+
+    let channels = get_dummy_channels(&server_name);
+    if channels.is_empty() {
+        send_empty_response(autocomplete, ctx).await;
+        return;
+    }
+
+    let channel_name = match &opt.value {
+        Some(serde_json::Value::String(input)) => input.clone(),
+        _ => {
+            send_empty_response(autocomplete, ctx).await;
+            return;
+        }
+    };
+
+    println!("Server name input: {}", server_name);
+    println!("Channel name input: {}", channel_name);
+    println!("Channels:\n{:#?}", channels);
+
+    // Matching score, lower score is a better match.
+    let mut matching: Vec<(isize, String)> = channels
+        .clone()
+        .into_iter()
+        .map(|s| {
+            let score = match best_match(channel_name.as_str(), s.as_str()) {
+                Some(m) => (100 - m.score(), s),
+                None => (100, s),
+            };
+            score
+        })
+        .collect();
+
+    if matching.is_empty() {
+        send_empty_response(autocomplete, ctx).await;
+        return;
+    }
+
+    matching.sort();
+    println!("Matching: {:#?}", matching);
+    matching.drain(cmp::min(25, matching.len())..);
+
+    autocomplete
+        .create_autocomplete_response(&ctx, move |rsp| {
+            for (_score, name) in matching {
+                rsp.add_string_choice(name.as_str(), name.as_str());
+            }
+            rsp
+        })
+        .await
+        .unwrap()
+}
+
+async fn connect_target_server_autocomplete(
+    opt: &ApplicationCommandInteractionDataOption,
+    autocomplete: &AutocompleteInteraction,
+    ctx: Context,
+) {
+    let server_name = match &opt.value {
+        Some(serde_json::Value::String(input)) => input.clone(),
+        _ => {
+            send_empty_response(autocomplete, ctx).await;
+            return;
+        }
+    };
+
+    println!("Server name input: {}", server_name);
+    if server_name.trim().is_empty() {
+        send_empty_response(autocomplete, ctx).await;
+        return;
+    }
+
+    let servers: Vec<String> = vec![
+        "Discord Analyst Bot Test Server".to_owned(),
+        "R2R Analytics".to_owned(),
+        "Boll är fet".to_owned(),
+        "Dijkscord".to_owned(),
+        "MaxBurglars".to_owned(),
+        "NORTH".to_owned(),
+        "Richens-server".to_owned(),
+    ];
+
+    // Matching score, lower score is a better match.
+    let mut matching: Vec<(isize, String)> = servers
+        .clone()
+        .into_iter()
+        .map(|s| {
+            let score = match best_match(server_name.as_str(), s.as_str()) {
+                Some(m) => (100 - m.score(), s),
+                None => (100, s),
+            };
+            score
+        })
+        .collect();
+
+    if matching.is_empty() {
+        send_empty_response(autocomplete, ctx).await;
+        return;
+    }
+
+    matching.sort();
+    println!("Matching: {:#?}", matching);
+    matching.drain(cmp::min(25, matching.len())..);
+
+    autocomplete
+        .create_autocomplete_response(&ctx, move |rsp| {
+            for (_score, name) in matching {
+                rsp.add_string_choice(name.as_str(), name.as_str());
+            }
+            rsp
+        })
+        .await
+        .unwrap()
+}
+
+fn find_opt<'a>(
+    name: &str,
+    autocomplete: &'a AutocompleteInteraction,
+) -> Option<&'a ApplicationCommandInteractionDataOption> {
+    autocomplete
+        .data
+        .options
+        .iter()
+        .find(|opt| opt.name == name)
+}
+
+async fn handle_autocomplete(autocomplete: AutocompleteInteraction, ctx: Context) {
+    match autocomplete.data.name.as_str() {
+        "connect" => {
+            let param_target_server = find_opt("target_server", &autocomplete);
+            let param_target_channel = find_opt("target_channel", &autocomplete);
+
+            if param_target_server.is_none() {
+                send_empty_response(&autocomplete, ctx).await;
+                return;
+            }
+            let param_target_server = param_target_server.unwrap();
+
+            if param_target_server.focused {
+                connect_target_server_autocomplete(param_target_server, &autocomplete, ctx).await;
+            } else if param_target_channel.is_some() && param_target_channel.unwrap().focused {
+                let param_target_channel = param_target_channel.unwrap();
+                let server_name = match &param_target_server.value {
+                    Some(serde_json::Value::String(input)) => input.clone(),
+                    _ => {
+                        send_empty_response(&autocomplete, ctx).await;
+                        return;
+                    }
+                };
+                connect_target_channel_autocomplete(
+                    &server_name,
+                    &param_target_channel,
+                    &autocomplete,
+                    ctx,
+                )
+                .await;
+            }
+        }
+        _ => (),
+    }
+}
+
+async fn application_command_response(
+    msg: String,
+    command: ApplicationCommandInteraction,
+    ctx: Context,
+) {
+    if let Err(why) = command
+        .create_interaction_response(&ctx.http, |response| {
+            response
+                .kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|message| message.content(msg))
+        })
+        .await
+    {
+        println!("Cannot respond to slash command: {}", why);
+    }
+}
+
+async fn handle_application_command(command: ApplicationCommandInteraction, ctx: Context) {
+    let content = match command.data.name.as_str() {
+        "ping" => "Hey, I'm alive!".to_string(),
+        "connect" => {
+            let options = &command.data.options;
+            let source = {
+                let op = options.iter().find(|&opt| opt.name == "source").unwrap();
+                if let ApplicationCommandInteractionDataOptionValue::Channel(ch) =
+                    op.resolved.as_ref().unwrap()
+                {
+                    ch
+                } else {
+                    application_command_response(
+                        format!("Error when reading source channel"),
+                        command,
+                        ctx,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let target_server = {
+                let op = options
+                    .iter()
+                    .find(|&opt| opt.name == "target_server")
+                    .unwrap();
+                if let ApplicationCommandInteractionDataOptionValue::String(s) =
+                    op.resolved.as_ref().unwrap()
+                {
+                    s
+                } else {
+                    application_command_response(
+                        format!("Error when reading target server"),
+                        command,
+                        ctx,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let target_channel = {
+                let op = options
+                    .iter()
+                    .find(|&opt| opt.name == "target_channel")
+                    .unwrap();
+                if let ApplicationCommandInteractionDataOptionValue::String(s) =
+                    op.resolved.as_ref().unwrap()
+                {
+                    s
+                } else {
+                    application_command_response(
+                        format!("Error when reading target channel"),
+                        command,
+                        ctx,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            format!(
+                "Source: {}\nTarget server: {}\nTarget channel: {}",
+                source.name, target_server, target_channel
+            )
+            // if let ApplicationCommandInteractionDataOptionValue::User(user, _member) = options {
+            //     format!("{}'s id is {}", user.tag(), user.id)
+            // } else {
+            //     "Please provide a valid user".to_string()
+            // }
+        }
+        _ => "not implemented :(".to_string(),
+    };
+    application_command_response(content, command, ctx).await;
 }
 
 #[hook]

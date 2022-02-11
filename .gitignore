@@ -4,3 +4,4 @@ token.txt
 data.db
 data.db-shm
 data.db-wal
+-- SQLite.sql
