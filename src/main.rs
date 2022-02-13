@@ -18,7 +18,7 @@ use serenity::{
         CommandResult, StandardFramework,
     },
     model::{
-        channel::{ChannelType, GuildChannel, Message},
+        channel::{Channel, ChannelType, GuildChannel, Message, PartialChannel},
         gateway::Ready,
         id::{ChannelId, GuildId, WebhookId},
         interactions::{
@@ -32,11 +32,13 @@ use serenity::{
         },
     },
     prelude::*,
+    utils::Color,
 };
 use sqlx::SqlitePool;
 use std::{
     cmp,
     collections::{HashMap, HashSet},
+    fmt::Display,
     sync::{atomic::*, Arc},
     thread,
     time::{Duration, Instant},
@@ -995,7 +997,7 @@ impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
             Interaction::ApplicationCommand(command) => {
-                handle_application_command(command, ctx).await
+                handle_application_command(&self.db, command, ctx).await
             }
             Interaction::Autocomplete(autocomplete) => handle_autocomplete(autocomplete, ctx).await,
             _ => println!("Received unknown interaction: {:#?}", interaction),
@@ -1071,10 +1073,6 @@ async fn connect_target_channel_autocomplete(
         }
     };
 
-    println!("Server name input: {}", server_name);
-    println!("Channel name input: {}", channel_name);
-    println!("Channels:\n{:#?}", channels);
-
     // Matching score, lower score is a better match.
     let mut matching: Vec<(isize, String)> = channels
         .clone()
@@ -1094,7 +1092,6 @@ async fn connect_target_channel_autocomplete(
     }
 
     matching.sort();
-    println!("Matching: {:#?}", matching);
     matching.drain(cmp::min(25, matching.len())..);
 
     autocomplete
@@ -1109,24 +1106,10 @@ async fn connect_target_channel_autocomplete(
 }
 
 async fn connect_target_server_autocomplete(
-    opt: &ApplicationCommandInteractionDataOption,
+    server_name: &String,
     autocomplete: &AutocompleteInteraction,
     ctx: Context,
 ) {
-    let server_name = match &opt.value {
-        Some(serde_json::Value::String(input)) => input.clone(),
-        _ => {
-            send_empty_response(autocomplete, ctx).await;
-            return;
-        }
-    };
-
-    println!("Server name input: {}", server_name);
-    if server_name.trim().is_empty() {
-        send_empty_response(autocomplete, ctx).await;
-        return;
-    }
-
     let servers: Vec<String> = vec![
         "Discord Analyst Bot Test Server".to_owned(),
         "R2R Analytics".to_owned(),
@@ -1156,7 +1139,6 @@ async fn connect_target_server_autocomplete(
     }
 
     matching.sort();
-    println!("Matching: {:#?}", matching);
     matching.drain(cmp::min(25, matching.len())..);
 
     autocomplete
@@ -1193,17 +1175,18 @@ async fn handle_autocomplete(autocomplete: AutocompleteInteraction, ctx: Context
             }
             let param_target_server = param_target_server.unwrap();
 
+            let server_name = match &param_target_server.value {
+                Some(serde_json::Value::String(input)) => input.clone(),
+                _ => {
+                    send_empty_response(&autocomplete, ctx).await;
+                    return;
+                }
+            };
+
             if param_target_server.focused {
-                connect_target_server_autocomplete(param_target_server, &autocomplete, ctx).await;
+                connect_target_server_autocomplete(&server_name, &autocomplete, ctx).await;
             } else if param_target_channel.is_some() && param_target_channel.unwrap().focused {
                 let param_target_channel = param_target_channel.unwrap();
-                let server_name = match &param_target_server.value {
-                    Some(serde_json::Value::String(input)) => input.clone(),
-                    _ => {
-                        send_empty_response(&autocomplete, ctx).await;
-                        return;
-                    }
-                };
                 connect_target_channel_autocomplete(
                     &server_name,
                     &param_target_channel,
@@ -1217,16 +1200,33 @@ async fn handle_autocomplete(autocomplete: AutocompleteInteraction, ctx: Context
     }
 }
 
-async fn application_command_response(
-    msg: String,
+async fn ok_connect_command_response<S>(
+    msg: S,
     command: ApplicationCommandInteraction,
     ctx: Context,
-) {
+) where
+    S: Into<String> + Display,
+{
+    //let username = command.user.name.clone();
+    // let user_url = format!("https://discord.com/users/{}", command.user.id);
+    // let icon_url = command
+    //     .user
+    //     .avatar_url()
+    //     .unwrap_or(command.user.default_avatar_url());
+    // println!("User url: {}", user_url);
+    // println!("Icon url: {}", icon_url);
     if let Err(why) = command
         .create_interaction_response(&ctx.http, |response| {
             response
                 .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| message.content(msg))
+                .interaction_response_data(|message| {
+                    message.create_embed(|e| {
+                        e /*.author(|a| a.name(username).url(user_url).icon_url(icon_url))*/
+                            .color(Color::DARK_GREEN)
+                            .title("Connection created")
+                            .description(msg)
+                    })
+                })
         })
         .await
     {
@@ -1234,20 +1234,89 @@ async fn application_command_response(
     }
 }
 
-async fn handle_application_command(command: ApplicationCommandInteraction, ctx: Context) {
-    let content = match command.data.name.as_str() {
-        "ping" => "Hey, I'm alive!".to_string(),
+async fn error_connect_command_response<S>(
+    msg: S,
+    command: ApplicationCommandInteraction,
+    ctx: Context,
+) where
+    S: Into<String> + Display,
+{
+    if let Err(why) = command
+        .create_interaction_response(&ctx.http, |response| {
+            response
+                .kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|message| {
+                    message.create_embed(|e| e.color(Color::RED).title("Error").description(msg))
+                })
+        })
+        .await
+    {
+        println!("Cannot respond to slash command: {}", why);
+    }
+}
+
+fn get_channel_opt<'a>(
+    name: &str,
+    options: &'a Vec<ApplicationCommandInteractionDataOption>,
+) -> Option<&'a PartialChannel> {
+    options.iter().find(|&opt| opt.name == name).and_then(|op| {
+        op.resolved.as_ref().and_then(|ch| match ch {
+            ApplicationCommandInteractionDataOptionValue::Channel(ch) => Some(ch),
+            _ => None,
+        })
+    })
+}
+
+fn get_string_opt<'a>(
+    name: &str,
+    options: &'a Vec<ApplicationCommandInteractionDataOption>,
+) -> Option<&'a String> {
+    options.iter().find(|&opt| opt.name == name).and_then(|op| {
+        op.resolved.as_ref().and_then(|ch| match ch {
+            ApplicationCommandInteractionDataOptionValue::String(s) => Some(s),
+            _ => None,
+        })
+    })
+}
+
+fn channel_id(channel_name: &String) -> Option<ChannelId> {
+    match channel_name.as_str() {
+        "#test-target-1" => Some(ChannelId(890972679518183535)),
+        _ => None,
+    }
+}
+
+fn server_id(server_name: &String) -> Option<GuildId> {
+    match server_name.as_str() {
+        "R2R Analytics" => Some(GuildId(831587658991403049)),
+        _ => None,
+    }
+}
+
+async fn name_to_ids(server_name: &String, channel_name: &String) -> Option<(GuildId, ChannelId)> {
+    // TODO: Implement real connection to the database.
+    let server = server_id(server_name);
+    let ch = channel_id(channel_name);
+    match (server, ch) {
+        (Some(server), Some(ch)) => Some((server, ch)),
+        _ => None,
+    }
+}
+
+async fn handle_application_command(
+    _db: &SqlitePool,
+    command: ApplicationCommandInteraction,
+    ctx: Context,
+) {
+    match command.data.name.as_str() {
         "connect" => {
             let options = &command.data.options;
             let source = {
-                let op = options.iter().find(|&opt| opt.name == "source").unwrap();
-                if let ApplicationCommandInteractionDataOptionValue::Channel(ch) =
-                    op.resolved.as_ref().unwrap()
-                {
+                if let Some(ch) = get_channel_opt("source", options) {
                     ch
                 } else {
-                    application_command_response(
-                        format!("Error when reading source channel"),
+                    error_connect_command_response(
+                        "Failed to read argument\n**source**",
                         command,
                         ctx,
                     )
@@ -1255,18 +1324,12 @@ async fn handle_application_command(command: ApplicationCommandInteraction, ctx:
                     return;
                 }
             };
-            let target_server = {
-                let op = options
-                    .iter()
-                    .find(|&opt| opt.name == "target_server")
-                    .unwrap();
-                if let ApplicationCommandInteractionDataOptionValue::String(s) =
-                    op.resolved.as_ref().unwrap()
-                {
+            let target_server_name = {
+                if let Some(s) = get_string_opt("target_server", options) {
                     s
                 } else {
-                    application_command_response(
-                        format!("Error when reading target server"),
+                    error_connect_command_response(
+                        "Failed to read argument\n**target_server**",
                         command,
                         ctx,
                     )
@@ -1274,18 +1337,12 @@ async fn handle_application_command(command: ApplicationCommandInteraction, ctx:
                     return;
                 }
             };
-            let target_channel = {
-                let op = options
-                    .iter()
-                    .find(|&opt| opt.name == "target_channel")
-                    .unwrap();
-                if let ApplicationCommandInteractionDataOptionValue::String(s) =
-                    op.resolved.as_ref().unwrap()
-                {
+            let target_channel_name = {
+                if let Some(s) = get_string_opt("target_channel", options) {
                     s
                 } else {
-                    application_command_response(
-                        format!("Error when reading target channel"),
+                    error_connect_command_response(
+                        "Failed to read argument\n**target_channel**",
                         command,
                         ctx,
                     )
@@ -1293,19 +1350,27 @@ async fn handle_application_command(command: ApplicationCommandInteraction, ctx:
                     return;
                 }
             };
-            format!(
-                "Source: {}\nTarget server: {}\nTarget channel: {}",
-                source.name, target_server, target_channel
-            )
-            // if let ApplicationCommandInteractionDataOptionValue::User(user, _member) = options {
-            //     format!("{}'s id is {}", user.tag(), user.id)
-            // } else {
-            //     "Please provide a valid user".to_string()
-            // }
+            let (_target_server_id, target_channel_id) =
+                name_to_ids(target_server_name, target_channel_name)
+                    .await
+                    .unwrap_or_default();
+            let content = format!(
+                "Source: <#{}>\nTarget server: {}\nTarget channel: <#{}>",
+                source.id,
+                target_server_name,
+                target_channel_id.as_u64()
+            );
+            ok_connect_command_response(content, command, ctx).await;
         }
-        _ => "not implemented :(".to_string(),
+        _ => {
+            error_connect_command_response(
+                format!("Unknown command\n**{}**", command.data.name.as_str()),
+                command,
+                ctx,
+            )
+            .await;
+        }
     };
-    application_command_response(content, command, ctx).await;
 }
 
 #[hook]
