@@ -3,6 +3,7 @@
 
 use console::style;
 use dialoguer::Input;
+use futures::TryFutureExt;
 use itertools::Itertools;
 use regex::Regex;
 use rillrate::prime::{
@@ -546,7 +547,7 @@ async fn create_server_mapping(db: &SqlitePool, ctx: &Context, guilds: &Vec<Guil
         for (ch_id, ch) in channels {
             if ch.kind == ChannelType::Text {
                 let channel_id = ch_id.0 as i64;
-                let name = ch.name;
+                let name = format!("#{}", ch.name);
                 sqlx::query!(
                     "INSERT OR REPLACE INTO Channels (id, name, guild_id) VALUES (?, ?, ?)",
                     channel_id,
@@ -1000,7 +1001,11 @@ impl EventHandler for Handler {
                 handle_application_command(&self.db, command, ctx).await
             }
             Interaction::Autocomplete(autocomplete) => handle_autocomplete(autocomplete, ctx).await,
-            _ => println!("Received unknown interaction: {:#?}", interaction),
+            _ => println!(
+                "{}\nReceived unknown interaction: {:#?}",
+                style("Error:").red(),
+                interaction
+            ),
         }
     }
 }
@@ -1279,32 +1284,55 @@ fn get_string_opt<'a>(
     })
 }
 
-fn channel_id(channel_name: &String) -> Option<ChannelId> {
-    match channel_name.as_str() {
-        "#test-target-1" => Some(ChannelId(890972679518183535)),
-        _ => None,
-    }
-}
+async fn name_to_ids(
+    db: &SqlitePool,
+    server_name: &String,
+    channel_name: &String,
+) -> Option<(GuildId, ChannelId)> {
+    println!("Server name: {server_name}");
+    println!("Channel name: {channel_name}");
+    let ids: Result<(GuildId, ChannelId), sqlx::Error> = sqlx::query!(
+        "
+        SELECT\n\
+        Guilds.name as guild_name,\n\
+        Guilds.id as \"guild_id: i64\",\n\
+        Channels.name as channel_name,\n\
+        Channels.id as \"channel_id: i64\"\n\
+        FROM Channels\n\
+        JOIN Guilds\n\
+        ON Channels.guild_id = Guilds.id\n\
+        WHERE guild_name = ? AND channel_name = ?
+        ",
+        server_name,
+        channel_name,
+    )
+    .fetch_one(db)
+    .and_then(|row| async move {
+        match (row.guild_id, row.channel_id) {
+            (Some(guild_id), Some(channel_id)) => {
+                Ok((GuildId(guild_id as u64), ChannelId(channel_id as u64)))
+            }
+            _ => {
+                println!("{}\nValues are NULL", style("Error:").red());
+                println!("GuildId: {:#?}", row.guild_id);
+                println!("ChannelId: {:#?}", row.channel_id);
+                Err(sqlx::Error::RowNotFound)
+            }
+        }
+    })
+    .await;
 
-fn server_id(server_name: &String) -> Option<GuildId> {
-    match server_name.as_str() {
-        "R2R Analytics" => Some(GuildId(831587658991403049)),
-        _ => None,
-    }
-}
-
-async fn name_to_ids(server_name: &String, channel_name: &String) -> Option<(GuildId, ChannelId)> {
-    // TODO: Implement real connection to the database.
-    let server = server_id(server_name);
-    let ch = channel_id(channel_name);
-    match (server, ch) {
-        (Some(server), Some(ch)) => Some((server, ch)),
-        _ => None,
+    match ids {
+        Ok((guild_id, channel_id)) => Some((guild_id, channel_id)),
+        Err(err) => {
+            println!("Database query error when reading guild/channel ids: {err}");
+            None
+        }
     }
 }
 
 async fn handle_application_command(
-    _db: &SqlitePool,
+    db: &SqlitePool,
     command: ApplicationCommandInteraction,
     ctx: Context,
 ) {
@@ -1351,7 +1379,7 @@ async fn handle_application_command(
                 }
             };
             let (_target_server_id, target_channel_id) =
-                name_to_ids(target_server_name, target_channel_name)
+                name_to_ids(db, target_server_name, target_channel_name)
                     .await
                     .unwrap_or_default();
             let content = format!(
