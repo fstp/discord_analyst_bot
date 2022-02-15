@@ -572,6 +572,26 @@ async fn get_server_names(db: &SqlitePool) -> Vec<String> {
         .collect()
 }
 
+async fn get_channel_names(
+    server_name: &String,
+    db: &SqlitePool,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query!(
+        "
+        SELECT Channels.name\n\
+        FROM Channels\n\
+        JOIN Guilds\n\
+        ON Guilds.name = ? AND Channels.guild_id = Guilds.id",
+        server_name
+    )
+    .fetch_all(db)
+    .and_then(|records| async {
+        let names: Vec<String> = records.into_iter().map(|record| record.name).collect();
+        Ok(names)
+    })
+    .await
+}
+
 async fn initiate_rillrate(db: &SqlitePool, ctx: Context) {
     let switch = Switch::new(
         [PACKAGE, DASHBOARD_CONFIG, GROUP_CONF, "Toggle Switch"],
@@ -1000,9 +1020,11 @@ impl EventHandler for Handler {
             Interaction::ApplicationCommand(command) => {
                 handle_application_command(&self.db, command, ctx).await
             }
-            Interaction::Autocomplete(autocomplete) => handle_autocomplete(autocomplete, ctx).await,
+            Interaction::Autocomplete(autocomplete) => {
+                handle_autocomplete(&self.db, autocomplete, ctx).await
+            }
             _ => println!(
-                "{}\nReceived unknown interaction: {:#?}",
+                "{}\nReceived unknown interaction:\n{:#?}",
                 style("Error:").red(),
                 interaction
             ),
@@ -1010,41 +1032,41 @@ impl EventHandler for Handler {
     }
 }
 
-fn get_dummy_channels(server_name: &String) -> Vec<String> {
-    match server_name.as_str() {
-        "Discord Analyst Bot Test Server" => {
-            vec![
-                "#general".to_owned(),
-                "#source".to_owned(),
-                "#target1".to_owned(),
-                "#target2".to_owned(),
-            ]
-        }
-        "R2R Analytics" => {
-            vec![
-                "#test-source-1".to_owned(),
-                "#test-source-2".to_owned(),
-                "#test-target-1".to_owned(),
-                "#test-target-2".to_owned(),
-            ]
-        }
-        "Boll är fet" => {
-            vec![
-                "#general".to_owned(),
-                "#Boll är fet".to_owned(),
-                "#Väntar på John".to_owned(),
-                "#Birkenstock".to_owned(),
-                "#Väntar på Marie".to_owned(),
-            ]
-        }
-        "Djikscord" => {
-            vec!["#general".to_owned(), "#music-bot-stfu-el".to_owned()]
-        }
-        _ => {
-            vec![]
-        }
-    }
-}
+// fn get_dummy_channels(server_name: &String) -> Vec<String> {
+//     match server_name.as_str() {
+//         "Discord Analyst Bot Test Server" => {
+//             vec![
+//                 "#general".to_owned(),
+//                 "#source".to_owned(),
+//                 "#target1".to_owned(),
+//                 "#target2".to_owned(),
+//             ]
+//         }
+//         "R2R Analytics" => {
+//             vec![
+//                 "#test-source-1".to_owned(),
+//                 "#test-source-2".to_owned(),
+//                 "#test-target-1".to_owned(),
+//                 "#test-target-2".to_owned(),
+//             ]
+//         }
+//         "Boll är fet" => {
+//             vec![
+//                 "#general".to_owned(),
+//                 "#Boll är fet".to_owned(),
+//                 "#Väntar på John".to_owned(),
+//                 "#Birkenstock".to_owned(),
+//                 "#Väntar på Marie".to_owned(),
+//             ]
+//         }
+//         "Djikscord" => {
+//             vec!["#general".to_owned(), "#music-bot-stfu-el".to_owned()]
+//         }
+//         _ => {
+//             vec![]
+//         }
+//     }
+// }
 
 async fn send_empty_response(autocomplete: &AutocompleteInteraction, ctx: Context) {
     autocomplete
@@ -1054,6 +1076,7 @@ async fn send_empty_response(autocomplete: &AutocompleteInteraction, ctx: Contex
 }
 
 async fn connect_target_channel_autocomplete(
+    db: &SqlitePool,
     server_name: &String,
     opt: &ApplicationCommandInteractionDataOption,
     autocomplete: &AutocompleteInteraction,
@@ -1064,11 +1087,20 @@ async fn connect_target_channel_autocomplete(
         return;
     }
 
-    let channels = get_dummy_channels(&server_name);
-    if channels.is_empty() {
-        send_empty_response(autocomplete, ctx).await;
-        return;
-    }
+    // let channels = get_dummy_channels(&server_name);
+    let channels = match get_channel_names(server_name, db).await {
+        Ok(channels) => channels,
+        Err(why) => {
+            println!(
+                "{}\nFailed to retreive channels for server {}\nWhy: {}",
+                style("Error:").red(),
+                style(server_name).cyan(),
+                style(why).cyan()
+            );
+            send_empty_response(autocomplete, ctx).await;
+            return;
+        }
+    };
 
     let channel_name = match &opt.value {
         Some(serde_json::Value::String(input)) => input.clone(),
@@ -1111,19 +1143,21 @@ async fn connect_target_channel_autocomplete(
 }
 
 async fn connect_target_server_autocomplete(
+    db: &SqlitePool,
     server_name: &String,
     autocomplete: &AutocompleteInteraction,
     ctx: Context,
 ) {
-    let servers: Vec<String> = vec![
-        "Discord Analyst Bot Test Server".to_owned(),
-        "R2R Analytics".to_owned(),
-        "Boll är fet".to_owned(),
-        "Dijkscord".to_owned(),
-        "MaxBurglars".to_owned(),
-        "NORTH".to_owned(),
-        "Richens-server".to_owned(),
-    ];
+    // let servers: Vec<String> = vec![
+    //     "Discord Analyst Bot Test Server".to_owned(),
+    //     "R2R Analytics".to_owned(),
+    //     "Boll är fet".to_owned(),
+    //     "Dijkscord".to_owned(),
+    //     "MaxBurglars".to_owned(),
+    //     "NORTH".to_owned(),
+    //     "Richens-server".to_owned(),
+    // ];
+    let servers = get_server_names(db).await;
 
     // Matching score, lower score is a better match.
     let mut matching: Vec<(isize, String)> = servers
@@ -1168,7 +1202,7 @@ fn find_opt<'a>(
         .find(|opt| opt.name == name)
 }
 
-async fn handle_autocomplete(autocomplete: AutocompleteInteraction, ctx: Context) {
+async fn handle_autocomplete(db: &SqlitePool, autocomplete: AutocompleteInteraction, ctx: Context) {
     match autocomplete.data.name.as_str() {
         "connect" => {
             let param_target_server = find_opt("target_server", &autocomplete);
@@ -1189,10 +1223,11 @@ async fn handle_autocomplete(autocomplete: AutocompleteInteraction, ctx: Context
             };
 
             if param_target_server.focused {
-                connect_target_server_autocomplete(&server_name, &autocomplete, ctx).await;
+                connect_target_server_autocomplete(db, &server_name, &autocomplete, ctx).await;
             } else if param_target_channel.is_some() && param_target_channel.unwrap().focused {
                 let param_target_channel = param_target_channel.unwrap();
                 connect_target_channel_autocomplete(
+                    db,
                     &server_name,
                     &param_target_channel,
                     &autocomplete,
