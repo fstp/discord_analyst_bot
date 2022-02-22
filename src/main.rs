@@ -21,7 +21,7 @@ use serenity::{
     model::{
         channel::{Channel, ChannelType, GuildChannel, Message, PartialChannel},
         gateway::Ready,
-        id::{ChannelId, GuildId, WebhookId},
+        id::{ChannelId, GuildId, UserId, WebhookId},
         interactions::{
             application_command::{
                 ApplicationCommand, ApplicationCommandInteraction,
@@ -31,6 +31,7 @@ use serenity::{
             autocomplete::{self, AutocompleteInteraction},
             Interaction, InteractionResponseType,
         },
+        webhook,
     },
     prelude::*,
     utils::Color,
@@ -964,55 +965,112 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot == false {
-            let data = self.data.lock().await;
-            match data.source_channels.get(&msg.channel_id) {
-                Some(source_channel) => {
-                    match data.channel_mapping.get(&source_channel.channel_tag) {
-                        Some(target_ids) => {
-                            for id in target_ids {
-                                let webhooks = id
-                                    .to_channel(&ctx)
-                                    .await
-                                    .unwrap()
-                                    .guild()
-                                    .unwrap()
-                                    .webhooks(&ctx)
-                                    .await
-                                    .unwrap();
-                                for hook in &webhooks {
-                                    match &hook.name {
-                                        Some(name) => {
-                                            if name == WEBHOOK_NAME {
-                                                // Found our webhook, execute it!
-                                                hook.execute(&ctx, false, |w| {
-                                                    w.content(&msg.content);
-                                                    w
-                                                })
-                                                .await
-                                                .unwrap();
-                                            }
-                                        }
-                                        None => {
-                                            // Couldn't get the name of the webhook,
-                                            // must not be ours then...
-                                        }
-                                    }
-                                }
+        if msg.author.bot == true {
+            return;
+        }
+        let source = msg.channel_id.0 as i64;
+        let user = msg.author.id.0 as i64;
+        println!("source: {source}, user: {user}");
+
+        let result = sqlx::query!(
+            "
+            SELECT webhook as \"webhook_id: i64\"\n\
+            FROM Connections\n\
+            WHERE Connections.source = ? AND Connections.user = ?
+            ",
+            source,
+            user,
+        )
+        .fetch_all(&self.db)
+        .and_then(|rows| async move {
+            Ok(rows
+                .into_iter()
+                .map(|row| row.webhook_id)
+                .collect::<Vec<i64>>())
+        })
+        .await;
+        match result {
+            Ok(webhook_ids) => {
+                for id in webhook_ids {
+                    let id = WebhookId(id as u64);
+                    match id.to_webhook(&ctx).await {
+                        Ok(webhook) => {
+                            let result = webhook
+                                .execute(&ctx, false, |w| {
+                                    w.content(&msg.content);
+                                    w
+                                })
+                                .await;
+                            match result {
+                                Err(why) => println!("Failed to execute webhook: {why}"),
+                                _ => (),
                             }
                         }
-                        None => {
-                            // No mapping (no targets) exist for this
-                            // source channel so we ignore the message.
+                        Err(why) => {
+                            println!("Discord API error when trying to resolve webhook: {why}");
+                            return;
                         }
                     }
                 }
-                None => {
-                    // Originating channel is not a source
-                    // so we ignore the message.
-                }
+            }
+            Err(why) => {
+                println!("Database error when trying to retrieve webhook: {why}");
+                return;
             }
         }
+
+        // .await;
+        // let webhook = match
+        // }
+        // if msg.author.bot == false {
+        //     let data = self.data.lock().await;
+        //     match data.source_channels.get(&msg.channel_id) {
+        //         Some(source_channel) => {
+        //             match data.channel_mapping.get(&source_channel.channel_tag) {
+        //                 Some(target_ids) => {
+        //                     for id in target_ids {
+        //                         let webhooks = id
+        //                             .to_channel(&ctx)
+        //                             .await
+        //                             .unwrap()
+        //                             .guild()
+        //                             .unwrap()
+        //                             .webhooks(&ctx)
+        //                             .await
+        //                             .unwrap();
+        //                         for hook in &webhooks {
+        //                             match &hook.name {
+        //                                 Some(name) => {
+        //                                     if name == WEBHOOK_NAME {
+        //                                         // Found our webhook, execute it!
+        //                                         hook.execute(&ctx, false, |w| {
+        //                                             w.content(&msg.content);
+        //                                             w
+        //                                         })
+        //                                         .await
+        //                                         .unwrap();
+        //                                     }
+        //                                 }
+        //                                 None => {
+        //                                     // Couldn't get the name of the webhook,
+        //                                     // must not be ours then...
+        //                                 }
+        //                             }
+        //                         }
+        //                     }
+        //                 }
+        //                 None => {
+        //                     // No mapping (no targets) exist for this
+        //                     // source channel so we ignore the message.
+        //                 }
+        //             }
+        //         }
+        //         None => {
+        //             // Originating channel is not a source
+        //             // so we ignore the message.
+        //         }
+        //     }
+        // }
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -1087,7 +1145,6 @@ async fn connect_target_channel_autocomplete(
         return;
     }
 
-    // let channels = get_dummy_channels(&server_name);
     let channels = match get_channel_names(server_name, db).await {
         Ok(channels) => channels,
         Err(why) => {
@@ -1242,19 +1299,11 @@ async fn handle_autocomplete(db: &SqlitePool, autocomplete: AutocompleteInteract
 
 async fn ok_connect_command_response<S>(
     msg: S,
-    command: ApplicationCommandInteraction,
-    ctx: Context,
+    command: &ApplicationCommandInteraction,
+    ctx: &Context,
 ) where
     S: Into<String> + Display,
 {
-    //let username = command.user.name.clone();
-    // let user_url = format!("https://discord.com/users/{}", command.user.id);
-    // let icon_url = command
-    //     .user
-    //     .avatar_url()
-    //     .unwrap_or(command.user.default_avatar_url());
-    // println!("User url: {}", user_url);
-    // println!("Icon url: {}", icon_url);
     if let Err(why) = command
         .create_interaction_response(&ctx.http, |response| {
             response
@@ -1276,8 +1325,8 @@ async fn ok_connect_command_response<S>(
 
 async fn error_connect_command_response<S>(
     msg: S,
-    command: ApplicationCommandInteraction,
-    ctx: Context,
+    command: &ApplicationCommandInteraction,
+    ctx: &Context,
 ) where
     S: Into<String> + Display,
 {
@@ -1343,17 +1392,21 @@ async fn name_to_ids(
     )
     .fetch_one(db)
     .and_then(|row| async move {
-        match (row.guild_id, row.channel_id) {
-            (Some(guild_id), Some(channel_id)) => {
-                Ok((GuildId(guild_id as u64), ChannelId(channel_id as u64)))
-            }
-            _ => {
-                println!("{}\nValues are NULL", style("Error:").red());
-                println!("GuildId: {:#?}", row.guild_id);
-                println!("ChannelId: {:#?}", row.channel_id);
-                Err(sqlx::Error::RowNotFound)
-            }
-        }
+        Ok((
+            GuildId(row.guild_id as u64),
+            ChannelId(row.channel_id as u64),
+        ))
+        // match (row.guild_id, row.channel_id) {
+        //     (guild_id), Some(channel_id)) => {
+
+        //     }
+        //     _ => {
+        //         println!("{}\nValues are NULL", style("Error:").red());
+        //         println!("GuildId: {:#?}", row.guild_id);
+        //         println!("ChannelId: {:#?}", row.channel_id);
+        //         Err(sqlx::Error::RowNotFound)
+        //     }
+        // }
     })
     .await;
 
@@ -1362,6 +1415,155 @@ async fn name_to_ids(
         Err(err) => {
             println!("Database query error when reading guild/channel ids: {err}");
             None
+        }
+    }
+}
+
+async fn get_webhook_id(
+    db: &SqlitePool,
+    user_id: &UserId,
+    channel_id: &ChannelId,
+) -> Option<WebhookId> {
+    let user_id = user_id.0 as i64;
+    let channel_id = channel_id.0 as i64;
+    let id: Result<i64, sqlx::Error> = sqlx::query!(
+        "
+        SELECT id as \"webhook_id: i64\"\n\
+        FROM Webhooks\n\
+        WHERE Webhooks.user_id = ? AND Webhooks.channel_id = ?
+        ",
+        user_id,
+        channel_id,
+    )
+    .fetch_optional(db)
+    .and_then(|row| async move {
+        match row {
+            Some(row) => Ok(row.webhook_id),
+            None => Err(sqlx::Error::RowNotFound),
+        }
+    })
+    .await;
+    match id {
+        Ok(webhook_id) => Some(WebhookId(webhook_id as u64)),
+        Err(_why) => None,
+    }
+}
+
+async fn maybe_add_webhook(
+    db: &SqlitePool,
+    user_id: &UserId,
+    channel_id: &ChannelId,
+    ctx: &Context,
+) -> Option<WebhookId> {
+    match get_webhook_id(db, user_id, channel_id).await {
+        Some(id) => return Some(id),
+        None => (),
+    }
+    let username = match user_id.to_user(&ctx).await {
+        Ok(user) => user.name.clone(),
+        Err(why) => {
+            println!("Failed in Discord API to retrieve username: {why}");
+            return None;
+        }
+    };
+    let guild_channel = channel_id
+        .to_channel(&ctx)
+        .await
+        .map_or(None, |channel| channel.guild());
+    let webhook_id = match guild_channel {
+        Some(ch) => match ch.create_webhook(&ctx, username).await {
+            Ok(webhook) => webhook.id,
+            Err(why) => {
+                println!("Failed in Discord API when trying to create webhook: {why}");
+                return None;
+            }
+        },
+        None => {
+            println!("Failed in Discord API when trying to get guild channel");
+            return None;
+        }
+    };
+    let id = webhook_id.0 as i64;
+    let user_id = user_id.0 as i64;
+    let channel_id = channel_id.0 as i64;
+    let result = sqlx::query!(
+        "INSERT OR REPLACE INTO Webhooks (id, user_id, channel_id) VALUES (?, ?, ?)",
+        id,
+        user_id,
+        channel_id,
+    )
+    .execute(db)
+    .await;
+    match result {
+        Ok(_) => Some(webhook_id),
+        Err(why) => {
+            println!("Failed to insert webhook into the database: {why}");
+            None
+        }
+    }
+}
+
+async fn connection_exists(
+    db: &SqlitePool,
+    source_channel_id: &ChannelId,
+    target_channel_id: &ChannelId,
+    webhook_id: &WebhookId,
+) -> Result<bool, sqlx::Error> {
+    let source = source_channel_id.0 as i64;
+    let target = target_channel_id.0 as i64;
+    let webhook = webhook_id.0 as i64;
+    let count: Result<i32, sqlx::Error> = sqlx::query!(
+        "
+        SELECT COUNT(1) as count\n\
+        FROM Connections\n\
+        WHERE Connections.source = ? AND Connections.target = ? AND Connections.webhook = ?
+        ",
+        source,
+        target,
+        webhook
+    )
+    .fetch_one(db)
+    .and_then(|row| async move { Ok(row.count) })
+    .await;
+    match count {
+        Ok(count) => return Ok(count != 0),
+        Err(why) => {
+            println!("Error occured when trying to read connections from database: {why}");
+            Err(why)
+        }
+    }
+}
+
+async fn maybe_add_connection(
+    db: &SqlitePool,
+    source_channel_id: &ChannelId,
+    target_channel_id: &ChannelId,
+    webhook_id: &WebhookId,
+    user_id: &UserId,
+) -> Result<bool, sqlx::Error> {
+    match connection_exists(db, source_channel_id, target_channel_id, webhook_id).await {
+        Ok(true) => return Ok(false),
+        Err(why) => return Err(why),
+        _ => (),
+    }
+    let source = source_channel_id.0 as i64;
+    let target = target_channel_id.0 as i64;
+    let webhook = webhook_id.0 as i64;
+    let user = user_id.0 as i64;
+    let result = sqlx::query!(
+        "INSERT OR REPLACE INTO Connections (source, target, webhook, user) VALUES (?, ?, ?, ?)",
+        source,
+        target,
+        webhook,
+        user
+    )
+    .execute(db)
+    .await;
+    match result {
+        Ok(_) => Ok(true),
+        Err(why) => {
+            println!("Failed to insert new connection into the database: {why}");
+            Err(why)
         }
     }
 }
@@ -1380,8 +1582,8 @@ async fn handle_application_command(
                 } else {
                     error_connect_command_response(
                         "Failed to read argument\n**source**",
-                        command,
-                        ctx,
+                        &command,
+                        &ctx,
                     )
                     .await;
                     return;
@@ -1393,8 +1595,8 @@ async fn handle_application_command(
                 } else {
                     error_connect_command_response(
                         "Failed to read argument\n**target_server**",
-                        command,
-                        ctx,
+                        &command,
+                        &ctx,
                     )
                     .await;
                     return;
@@ -1406,8 +1608,8 @@ async fn handle_application_command(
                 } else {
                     error_connect_command_response(
                         "Failed to read argument\n**target_channel**",
-                        command,
-                        ctx,
+                        &command,
+                        &ctx,
                     )
                     .await;
                     return;
@@ -1417,19 +1619,56 @@ async fn handle_application_command(
                 name_to_ids(db, target_server_name, target_channel_name)
                     .await
                     .unwrap_or_default();
-            let content = format!(
-                "Source: <#{}>\nTarget server: {}\nTarget channel: <#{}>",
-                source.id,
-                target_server_name,
-                target_channel_id.as_u64()
-            );
-            ok_connect_command_response(content, command, ctx).await;
+            let webhook_id =
+                match maybe_add_webhook(db, &command.user.id, &target_channel_id, &ctx).await {
+                    Some(webhook_id) => webhook_id,
+                    None => {
+                        println!("Failed to create webhook");
+                        error_connect_command_response(
+                            format!(
+                                "Internal error, failed to create webhook in <#{}>",
+                                target_channel_id.as_u64()
+                            ),
+                            &command,
+                            &ctx,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+            match maybe_add_connection(
+                db,
+                &source.id,
+                &target_channel_id,
+                &webhook_id,
+                &command.user.id,
+            )
+            .await
+            {
+                Ok(true) => {
+                    let content = format!(
+                        "Source: <#{}>\nTarget server: {}\nTarget channel: <#{}>",
+                        source.id,
+                        target_server_name,
+                        target_channel_id.as_u64()
+                    );
+                    ok_connect_command_response(content, &command, &ctx).await;
+                }
+                Ok(false) => {
+                    let content = "Connection already exists";
+                    error_connect_command_response(content, &command, &ctx).await;
+                }
+                Err(why) => {
+                    let content = format!("Internal error, failed to add connection:\n{why}");
+                    error_connect_command_response(content, &command, &ctx).await;
+                }
+            }
         }
         _ => {
             error_connect_command_response(
                 format!("Unknown command\n**{}**", command.data.name.as_str()),
-                command,
-                ctx,
+                &command,
+                &ctx,
             )
             .await;
         }
