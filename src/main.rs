@@ -563,13 +563,23 @@ async fn create_server_mapping(db: &SqlitePool, ctx: &Context, guilds: &Vec<Guil
     }
 }
 
-async fn get_server_names(db: &SqlitePool) -> Vec<String> {
+async fn get_guild_names(db: &SqlitePool) -> Vec<String> {
     sqlx::query!("SELECT Guilds.name FROM Guilds")
         .fetch_all(db)
         .await
         .unwrap()
         .into_iter()
         .map(|record| record.name)
+        .collect()
+}
+
+async fn get_guild_ids(db: &SqlitePool) -> Vec<GuildId> {
+    sqlx::query!("SELECT Guilds.id FROM Guilds")
+        .fetch_all(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| GuildId(record.id as u64))
         .collect()
 }
 
@@ -640,7 +650,7 @@ async fn initiate_rillrate(db: &SqlitePool, ctx: Context) {
     //     }
     //     values
     // };
-    let servers = get_server_names(db).await;
+    let servers = get_guild_names(db).await;
 
     // You are also able to have different actions in different elements interact with
     // the same data.
@@ -842,14 +852,12 @@ impl EventHandler for Handler {
     // In this case, just print what the current user's username is.
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected to Discord", ready.user.name);
-        // !HACK
-        let guild_id = GuildId(936607370983911454);
-        let commands = GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
-            commands
-                .create_application_command(|command| {
-                    command.name("ping").description("A ping command")
-                })
-                .create_application_command(|command| {
+        let guild_ids = get_guild_ids(&self.db).await;
+        for id in guild_ids {
+            // !HACK
+            //let guild_id = GuildId(936607370983911454);
+            let result = GuildId::set_application_commands(&id, &ctx.http, |commands| {
+                commands.create_application_command(|command| {
                     command
                         .name("connect")
                         .description("Connect a source channel to a target channel")
@@ -878,81 +886,14 @@ impl EventHandler for Handler {
                                 .set_autocomplete(true)
                         })
                 })
-                .create_application_command(|command| {
-                    command
-                        .name("welcome")
-                        .description("Welcome a user")
-                        .create_option(|option| {
-                            option
-                                .name("user")
-                                .description("The user to welcome")
-                                .kind(ApplicationCommandOptionType::User)
-                                .required(true)
-                        })
-                        .create_option(|option| {
-                            option
-                                .name("message")
-                                .description("The message to send")
-                                .kind(ApplicationCommandOptionType::String)
-                                .required(true)
-                                .add_string_choice(
-                                    "Welcome to our cool server! Ask me if you need help",
-                                    "pizza",
-                                )
-                                .add_string_choice("Hey, do you want a coffee?", "coffee")
-                                .add_string_choice(
-                                    "Welcome to the club, you're now a good person. Well, I hope.",
-                                    "club",
-                                )
-                                .add_string_choice(
-                                    "I hope that you brought a controller to play together!",
-                                    "game",
-                                )
-                        })
-                })
-                .create_application_command(|command| {
-                    command
-                        .name("numberinput")
-                        .description("Test command for number input")
-                        .create_option(|option| {
-                            option
-                                .name("int")
-                                .description("An integer from 5 to 10")
-                                .kind(ApplicationCommandOptionType::Integer)
-                                .min_int_value(5)
-                                .max_int_value(10)
-                                .required(true)
-                        })
-                        .create_option(|option| {
-                            option
-                                .name("number")
-                                .description("A float from -3.3 to 234.5")
-                                .kind(ApplicationCommandOptionType::Number)
-                                .min_number_value(-3.3)
-                                .max_number_value(234.5)
-                                .required(true)
-                        })
-                })
-        })
-        .await;
-
-        println!(
-            "I now have the following guild slash commands: {:#?}",
-            commands
-        );
-
-        let guild_command =
-            ApplicationCommand::create_global_application_command(&ctx.http, |command| {
-                command
-                    .name("wonderful_command")
-                    .description("An amazing command")
             })
             .await;
-
-        println!(
-            "I created the following global slash command: {:#?}",
-            guild_command
-        );
+            let guild_name = id.name(&ctx).await.unwrap();
+            match result {
+                Ok(_) => println!("Successfully installed slash commands in {guild_name}"),
+                Err(why) => println!("Failed to install slash commands in {guild_name}: {why}"),
+            }
+        }
     }
 
     async fn cache_ready(&self, ctx: Context, guilds: Vec<GuildId>) {
@@ -1214,7 +1155,7 @@ async fn connect_target_server_autocomplete(
     //     "NORTH".to_owned(),
     //     "Richens-server".to_owned(),
     // ];
-    let servers = get_server_names(db).await;
+    let servers = get_guild_names(db).await;
 
     // Matching score, lower score is a better match.
     let mut matching: Vec<(isize, String)> = servers
