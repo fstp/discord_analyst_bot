@@ -429,7 +429,7 @@ async fn create_server_mapping(db: &SqlitePool, ctx: &Context, guilds: &Vec<Guil
                 let channel_id = ch_id.0 as i64;
                 let name = format!("#{}", ch.name);
                 sqlx::query!(
-                    "INSERT OR REPLACE INTO Channels (id, name, guild_id) VALUES (?, ?, ?)",
+                    "INSERT OR REPLACE INTO Channels (id, name, guild) VALUES (?, ?, ?)",
                     channel_id,
                     name,
                     guild_id,
@@ -471,7 +471,7 @@ async fn get_channel_names(
         SELECT Channels.name\n\
         FROM Channels\n\
         JOIN Guilds\n\
-        ON Guilds.name = ? AND Channels.guild_id = Guilds.id",
+        ON Guilds.name = ? AND Channels.guild = Guilds.id",
         server_name
     )
     .fetch_all(db)
@@ -525,35 +525,57 @@ impl EventHandler for Handler {
         let guild_ids = get_guild_ids(&self.db).await;
         for id in guild_ids {
             let result = GuildId::set_application_commands(&id, &ctx.http, |commands| {
-                commands.create_application_command(|command| {
-                    command
-                        .name("connect")
-                        .description("Connect a source channel to a target channel")
-                        .create_option(|option| {
-                            option
-                                .name("source")
-                                .description("Source channel")
-                                .kind(ApplicationCommandOptionType::Channel)
-                                .required(true)
-                            //.set_autocomplete(true)
-                        })
-                        .create_option(|option| {
-                            option
-                                .name("target_server")
-                                .description("Target server")
-                                .kind(ApplicationCommandOptionType::String)
-                                .required(true)
-                                .set_autocomplete(true)
-                        })
-                        .create_option(|option| {
-                            option
-                                .name("target_channel")
-                                .description("Target channel")
-                                .kind(ApplicationCommandOptionType::String)
-                                .required(true)
-                                .set_autocomplete(true)
-                        })
-                })
+                commands
+                    .create_application_command(|command| {
+                        command
+                            .name("connect")
+                            .description("Connect a source channel to a target channel")
+                            .create_option(|option| {
+                                option
+                                    .name("source")
+                                    .description("Source channel")
+                                    .kind(ApplicationCommandOptionType::Channel)
+                                    .required(true)
+                                //.set_autocomplete(true)
+                            })
+                            .create_option(|option| {
+                                option
+                                    .name("target_server")
+                                    .description("Target server")
+                                    .kind(ApplicationCommandOptionType::String)
+                                    .required(true)
+                                    .set_autocomplete(true)
+                            })
+                            .create_option(|option| {
+                                option
+                                    .name("target_channel")
+                                    .description("Target channel")
+                                    .kind(ApplicationCommandOptionType::String)
+                                    .required(true)
+                                    .set_autocomplete(true)
+                            })
+                    })
+                    .create_application_command(|command| {
+                        command
+                            .name("disconnect")
+                            .description("Disconnect a source channel from a target channel")
+                            .create_option(|option| {
+                                option
+                                    .name("source")
+                                    .description("Source channel")
+                                    .kind(ApplicationCommandOptionType::Channel)
+                                    .required(true)
+                                //.set_autocomplete(true)
+                            })
+                            .create_option(|option| {
+                                option
+                                    .name("target_channel")
+                                    .description("Target channel")
+                                    .kind(ApplicationCommandOptionType::String)
+                                    .required(true)
+                                    .set_autocomplete(true)
+                            })
+                    })
             })
             .await;
             let guild_name = id.name(&ctx).await.unwrap();
@@ -643,6 +665,109 @@ impl EventHandler for Handler {
 async fn send_empty_response(autocomplete: &AutocompleteInteraction, ctx: Context) {
     autocomplete
         .create_autocomplete_response(&ctx, move |rsp| rsp)
+        .await
+        .unwrap()
+}
+
+async fn disconnect_target_channel_autocomplete(
+    db: &SqlitePool,
+    source_channel: &ApplicationCommandInteractionDataOption,
+    target_channel: &ApplicationCommandInteractionDataOption,
+    autocomplete: &AutocompleteInteraction,
+    ctx: Context,
+) {
+    let target_channel = match &target_channel.value {
+        Some(serde_json::Value::String(input)) => input.clone(),
+        _ => {
+            println!("(disconnect) Failed to read target channel");
+            send_empty_response(autocomplete, ctx).await;
+            return;
+        }
+    };
+
+    let source_channel: i64 = match &source_channel.value {
+        Some(serde_json::Value::String(input)) => match input.parse() {
+            Ok(id) => id,
+            Err(why) => {
+                println!("(disconnect) Failed to parse source channel: {why}");
+                send_empty_response(autocomplete, ctx).await;
+                return;
+            }
+        },
+        _ => {
+            println!("(disconnect) Source channel option is empty");
+            send_empty_response(autocomplete, ctx).await;
+            return;
+        }
+    };
+
+    let channels: Vec<String> = {
+        let result = sqlx::query!(
+            "
+            SELECT\n\
+            Guilds.name as guild_name,\n\
+            Channels.name as channel_name\n\
+            FROM Channels\n\
+            JOIN Connections\n\
+            ON Channels.id = Connections.target\n\
+            JOIN Guilds\n\
+            ON Channels.guild = Guilds.id\n\
+            WHERE Connections.source = ?\n\
+            ORDER BY Guilds.name
+            ",
+            source_channel
+        )
+        .fetch_all(db)
+        .and_then(|rows| async move {
+            Ok(rows
+                .into_iter()
+                .map(|row| format!("[{}] {}", row.guild_name, row.channel_name))
+                .collect::<Vec<String>>())
+        })
+        .await;
+        match result {
+            Ok(channels) => channels,
+            Err(why) => {
+                println!("(disconnect) Database error when trying to autocomplete: {why}");
+                send_empty_response(autocomplete, ctx).await;
+                return;
+            }
+        }
+    };
+
+    if channels.is_empty() {
+        send_empty_response(autocomplete, ctx).await;
+        return;
+    }
+
+    // Matching score, lower score is a better match.
+    let mut matching: Vec<(isize, String)> = channels
+        .clone()
+        .into_iter()
+        .map(|s| {
+            let score = match best_match(target_channel.as_str(), s.as_str()) {
+                Some(m) => (100 - m.score(), s),
+                None => (100, s),
+            };
+            score
+        })
+        .collect();
+
+    if matching.is_empty() {
+        send_empty_response(autocomplete, ctx).await;
+        return;
+    }
+
+    matching.sort();
+    matching.drain(cmp::min(25, matching.len())..);
+
+    autocomplete
+        .create_autocomplete_response(&ctx, move |rsp| {
+            for (_score, name) in matching {
+                rsp.add_string_choice(name.as_str(), name.as_str());
+            }
+            rsp
+        })
         .await
         .unwrap()
 }
@@ -766,48 +891,79 @@ fn find_opt<'a>(
 
 async fn handle_autocomplete(db: &SqlitePool, autocomplete: AutocompleteInteraction, ctx: Context) {
     match autocomplete.data.name.as_str() {
-        "connect" => {
-            let param_target_server = find_opt("target_server", &autocomplete);
-            let param_target_channel = find_opt("target_channel", &autocomplete);
-
-            if param_target_server.is_none() {
-                send_empty_response(&autocomplete, ctx).await;
-                return;
-            }
-            let param_target_server = param_target_server.unwrap();
-
-            let server_name = match &param_target_server.value {
-                Some(serde_json::Value::String(input)) => input.clone(),
-                _ => {
-                    send_empty_response(&autocomplete, ctx).await;
-                    return;
-                }
-            };
-
-            if param_target_server.focused {
-                connect_target_server_autocomplete(db, &server_name, &autocomplete, ctx).await;
-            } else if param_target_channel.is_some() && param_target_channel.unwrap().focused {
-                let param_target_channel = param_target_channel.unwrap();
-                connect_target_channel_autocomplete(
-                    db,
-                    &server_name,
-                    &param_target_channel,
-                    &autocomplete,
-                    ctx,
-                )
-                .await;
-            }
-        }
-        _ => (),
+        "connect" => handle_connect_autocomplete(autocomplete, ctx, db).await,
+        "disconnect" => handle_disconnect_autocomplete(autocomplete, ctx, db).await,
+        s => println!("Unhandled autocomplete: {s}"),
     }
 }
 
-async fn ok_connect_command_response<S>(
-    msg: S,
+async fn handle_connect_autocomplete(
+    autocomplete: AutocompleteInteraction,
+    ctx: Context,
+    db: &SqlitePool,
+) {
+    let param_target_server = find_opt("target_server", &autocomplete);
+    let param_target_channel = find_opt("target_channel", &autocomplete);
+    if param_target_server.is_none() {
+        send_empty_response(&autocomplete, ctx).await;
+        return;
+    }
+    let param_target_server = param_target_server.unwrap();
+    let server_name = match &param_target_server.value {
+        Some(serde_json::Value::String(input)) => input.clone(),
+        _ => {
+            send_empty_response(&autocomplete, ctx).await;
+            return;
+        }
+    };
+    if param_target_server.focused {
+        connect_target_server_autocomplete(db, &server_name, &autocomplete, ctx).await;
+    } else if param_target_channel.is_some() && param_target_channel.unwrap().focused {
+        let param_target_channel = param_target_channel.unwrap();
+        connect_target_channel_autocomplete(
+            db,
+            &server_name,
+            &param_target_channel,
+            &autocomplete,
+            ctx,
+        )
+        .await;
+    }
+}
+
+async fn handle_disconnect_autocomplete(
+    autocomplete: AutocompleteInteraction,
+    ctx: Context,
+    db: &SqlitePool,
+) {
+    let param_source_channel = find_opt("source", &autocomplete);
+    let param_target_channel = find_opt("target_channel", &autocomplete);
+
+    if param_source_channel.is_some()
+        && param_target_channel.is_some()
+        && param_target_channel.unwrap().focused
+    {
+        let param_source_channel = param_source_channel.unwrap();
+        let param_target_channel = param_target_channel.unwrap();
+        disconnect_target_channel_autocomplete(
+            db,
+            &param_source_channel,
+            &param_target_channel,
+            &autocomplete,
+            ctx,
+        )
+        .await;
+    }
+}
+
+async fn ok_command_response<S1, S2>(
+    title: S1,
+    msg: S2,
     command: &ApplicationCommandInteraction,
     ctx: &Context,
 ) where
-    S: Into<String> + Display,
+    S1: Into<String> + Display,
+    S2: Into<String> + Display,
 {
     if let Err(why) = command
         .create_interaction_response(&ctx.http, |response| {
@@ -817,22 +973,19 @@ async fn ok_connect_command_response<S>(
                     message.create_embed(|e| {
                         e /*.author(|a| a.name(username).url(user_url).icon_url(icon_url))*/
                             .color(Color::DARK_GREEN)
-                            .title("Connection created")
+                            .title(title)
                             .description(msg)
                     })
                 })
         })
         .await
     {
-        println!("Cannot respond to slash command: {}", why);
+        println!("Cannot respond to slash command: {why}");
     }
 }
 
-async fn error_connect_command_response<S>(
-    msg: S,
-    command: &ApplicationCommandInteraction,
-    ctx: &Context,
-) where
+async fn error_command_response<S>(msg: S, command: &ApplicationCommandInteraction, ctx: &Context)
+where
     S: Into<String> + Display,
 {
     if let Err(why) = command
@@ -889,7 +1042,7 @@ async fn name_to_ids(
         Channels.id as \"channel_id: i64\"\n\
         FROM Channels\n\
         JOIN Guilds\n\
-        ON Channels.guild_id = Guilds.id\n\
+        ON Channels.guild = Guilds.id\n\
         WHERE guild_name = ? AND channel_name = ?
         ",
         server_name,
@@ -916,18 +1069,18 @@ async fn name_to_ids(
 async fn get_webhook_id(
     db: &SqlitePool,
     user_id: &UserId,
-    channel_id: &ChannelId,
+    target_channel_id: &ChannelId,
 ) -> Option<WebhookId> {
-    let user_id = user_id.0 as i64;
-    let channel_id = channel_id.0 as i64;
+    let user = user_id.0 as i64;
+    let target = target_channel_id.0 as i64;
     let id: Result<i64, sqlx::Error> = sqlx::query!(
         "
         SELECT id as \"webhook_id: i64\"\n\
         FROM Webhooks\n\
-        WHERE Webhooks.user_id = ? AND Webhooks.channel_id = ?
+        WHERE Webhooks.user = ? AND Webhooks.target = ?
         ",
-        user_id,
-        channel_id,
+        user,
+        target,
     )
     .fetch_optional(db)
     .and_then(|row| async move {
@@ -946,10 +1099,10 @@ async fn get_webhook_id(
 async fn maybe_add_webhook(
     db: &SqlitePool,
     user_id: &UserId,
-    channel_id: &ChannelId,
+    target_channel_id: &ChannelId,
     ctx: &Context,
 ) -> Option<WebhookId> {
-    match get_webhook_id(db, user_id, channel_id).await {
+    match get_webhook_id(db, user_id, target_channel_id).await {
         Some(id) => return Some(id),
         None => (),
     }
@@ -960,11 +1113,11 @@ async fn maybe_add_webhook(
             return None;
         }
     };
-    let guild_channel = channel_id
+    let target_guild_channel = target_channel_id
         .to_channel(&ctx)
         .await
         .map_or(None, |channel| channel.guild());
-    let webhook_id = match guild_channel {
+    let webhook_id = match target_guild_channel {
         Some(ch) => match ch.create_webhook(&ctx, username).await {
             Ok(webhook) => webhook.id,
             Err(why) => {
@@ -978,13 +1131,13 @@ async fn maybe_add_webhook(
         }
     };
     let id = webhook_id.0 as i64;
-    let user_id = user_id.0 as i64;
-    let channel_id = channel_id.0 as i64;
+    let user = user_id.0 as i64;
+    let target = target_channel_id.0 as i64;
     let result = sqlx::query!(
-        "INSERT OR REPLACE INTO Webhooks (id, user_id, channel_id) VALUES (?, ?, ?)",
+        "INSERT OR REPLACE INTO Webhooks (id, target, user) VALUES (?, ?, ?)",
         id,
-        user_id,
-        channel_id,
+        target,
+        user,
     )
     .execute(db)
     .await;
@@ -1062,104 +1215,182 @@ async fn maybe_add_connection(
     }
 }
 
+async fn handle_connect_command(
+    db: &SqlitePool,
+    command: ApplicationCommandInteraction,
+    ctx: Context,
+) {
+    let options = &command.data.options;
+    let source = {
+        if let Some(ch) = get_channel_opt("source", options) {
+            ch
+        } else {
+            error_command_response("Failed to read argument\n**source**", &command, &ctx).await;
+            return;
+        }
+    };
+    let target_server_name = {
+        if let Some(s) = get_string_opt("target_server", options) {
+            s
+        } else {
+            error_command_response("Failed to read argument\n**target_server**", &command, &ctx)
+                .await;
+            return;
+        }
+    };
+    let target_channel_name = {
+        if let Some(s) = get_string_opt("target_channel", options) {
+            s
+        } else {
+            error_command_response(
+                "Failed to read argument\n**target_channel**",
+                &command,
+                &ctx,
+            )
+            .await;
+            return;
+        }
+    };
+    let (_target_server_id, target_channel_id) =
+        name_to_ids(db, target_server_name, target_channel_name)
+            .await
+            .unwrap_or_default();
+    let webhook_id = match maybe_add_webhook(db, &command.user.id, &target_channel_id, &ctx).await {
+        Some(webhook_id) => webhook_id,
+        None => {
+            println!("Failed to create webhook");
+            error_command_response(
+                format!(
+                    "Internal error, failed to create webhook in <#{}>",
+                    target_channel_id.as_u64()
+                ),
+                &command,
+                &ctx,
+            )
+            .await;
+            return;
+        }
+    };
+    match maybe_add_connection(
+        db,
+        &source.id,
+        &target_channel_id,
+        &webhook_id,
+        &command.user.id,
+    )
+    .await
+    {
+        Ok(true) => {
+            let content = format!(
+                "Source: <#{}>\nTarget server: {}\nTarget channel: <#{}>",
+                source.id,
+                target_server_name,
+                target_channel_id.as_u64()
+            );
+            ok_command_response("Connection created", content, &command, &ctx).await;
+        }
+        Ok(false) => {
+            let content = "Connection already exists";
+            error_command_response(content, &command, &ctx).await;
+        }
+        Err(why) => {
+            let content = format!("Internal error, failed to add connection:\n{why}");
+            error_command_response(content, &command, &ctx).await;
+        }
+    }
+}
+
+async fn handle_disconnect_command(
+    db: &SqlitePool,
+    command: ApplicationCommandInteraction,
+    ctx: Context,
+) {
+    let options = &command.data.options;
+
+    let source_channel = {
+        if let Some(ch) = get_channel_opt("source", options) {
+            ch
+        } else {
+            error_command_response("Failed to read argument\n**source**", &command, &ctx).await;
+            return;
+        }
+    };
+
+    let combined = {
+        if let Some(s) = get_string_opt("target_channel", options) {
+            s
+        } else {
+            error_command_response(
+                "Failed to read argument\n**target_channel**",
+                &command,
+                &ctx,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let re = Regex::new(r"\[(?P<server>.*)\] (?P<channel>.*)").unwrap();
+    let (target_server_name, target_channel_name) = match re.captures(combined) {
+        Some(caps) => {
+            let server_name = caps["server"].trim().to_owned();
+            let channel_name = caps["channel"].trim().to_owned();
+            (server_name, channel_name)
+        }
+        None => {
+            error_command_response(
+                "Invalid target channel format\nIt has to be the following format: [<SERVER_NAME>] <CHANNEL_NAME>",
+                &command,
+                &ctx).await;
+            return;
+        }
+    };
+
+    if let Some((_target_server_id, target_channel_id)) =
+        name_to_ids(db, &target_server_name, &target_channel_name).await
+    {
+        let source = source_channel.id.0 as i64;
+        let target = target_channel_id.0 as i64;
+        let user = command.user.id.0 as i64;
+
+        let result = sqlx::query!(
+            "DELETE FROM Connections WHERE source = ? AND target = ? AND user = ?",
+            source,
+            target,
+            user
+        )
+        .execute(db)
+        .await;
+        match result {
+            Ok(_) => (),
+            Err(why) => {
+                println!("Database error, failed to delete connection: {why}");
+                error_command_response("Database error", &command, &ctx).await;
+                return;
+            }
+        }
+
+        let msg = format!(
+            "Source: <#{}>\nServer: {target_server_name}\nTarget: {target_channel_name}",
+            source
+        );
+        ok_command_response("Disconnected", msg, &command, &ctx).await;
+    } else {
+        error_command_response("Internal error trying to obtain channel id", &command, &ctx).await;
+        return;
+    }
+}
+
 async fn handle_application_command(
     db: &SqlitePool,
     command: ApplicationCommandInteraction,
     ctx: Context,
 ) {
     match command.data.name.as_str() {
-        "connect" => {
-            let options = &command.data.options;
-            let source = {
-                if let Some(ch) = get_channel_opt("source", options) {
-                    ch
-                } else {
-                    error_connect_command_response(
-                        "Failed to read argument\n**source**",
-                        &command,
-                        &ctx,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let target_server_name = {
-                if let Some(s) = get_string_opt("target_server", options) {
-                    s
-                } else {
-                    error_connect_command_response(
-                        "Failed to read argument\n**target_server**",
-                        &command,
-                        &ctx,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let target_channel_name = {
-                if let Some(s) = get_string_opt("target_channel", options) {
-                    s
-                } else {
-                    error_connect_command_response(
-                        "Failed to read argument\n**target_channel**",
-                        &command,
-                        &ctx,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let (_target_server_id, target_channel_id) =
-                name_to_ids(db, target_server_name, target_channel_name)
-                    .await
-                    .unwrap_or_default();
-            let webhook_id =
-                match maybe_add_webhook(db, &command.user.id, &target_channel_id, &ctx).await {
-                    Some(webhook_id) => webhook_id,
-                    None => {
-                        println!("Failed to create webhook");
-                        error_connect_command_response(
-                            format!(
-                                "Internal error, failed to create webhook in <#{}>",
-                                target_channel_id.as_u64()
-                            ),
-                            &command,
-                            &ctx,
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            match maybe_add_connection(
-                db,
-                &source.id,
-                &target_channel_id,
-                &webhook_id,
-                &command.user.id,
-            )
-            .await
-            {
-                Ok(true) => {
-                    let content = format!(
-                        "Source: <#{}>\nTarget server: {}\nTarget channel: <#{}>",
-                        source.id,
-                        target_server_name,
-                        target_channel_id.as_u64()
-                    );
-                    ok_connect_command_response(content, &command, &ctx).await;
-                }
-                Ok(false) => {
-                    let content = "Connection already exists";
-                    error_connect_command_response(content, &command, &ctx).await;
-                }
-                Err(why) => {
-                    let content = format!("Internal error, failed to add connection:\n{why}");
-                    error_connect_command_response(content, &command, &ctx).await;
-                }
-            }
-        }
+        "connect" => handle_connect_command(db, command, ctx).await,
+        "disconnect" => handle_disconnect_command(db, command, ctx).await,
         _ => {
-            error_connect_command_response(
+            error_command_response(
                 format!("Unknown command\n**{}**", command.data.name.as_str()),
                 &command,
                 &ctx,

@@ -13,15 +13,15 @@ CREATE TABLE IF NOT EXISTS "Guilds" (
 CREATE TABLE IF NOT EXISTS "Channels" (
   "id"          INTEGER PRIMARY KEY NOT NULL,
   "name"        TEXT                NOT NULL,
-  "guild_id"    INTEGER             NOT NULL,
-  FOREIGN KEY ("guild_id") REFERENCES "Guilds"("id")
+  "guild"       INTEGER             NOT NULL,
+  FOREIGN KEY ("guild") REFERENCES "Guilds"("id") ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS "Webhooks" (
   "id"          INTEGER PRIMARY KEY NOT NULL,
-  "user_id"     INTEGER             NOT NULL,
-  "channel_id"  INTEGER             NOT NULL,
-  FOREIGN KEY ("channel_id") REFERENCES "Channels"("id")
+  "target"      INTEGER             NOT NULL,
+  "user"        INTEGER             NOT NULL,
+  FOREIGN KEY ("target") REFERENCES "Channels"("id") ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS "Connections" (
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS "Connections" (
   "target"      INTEGER             NOT NULL,
   "webhook"     INTEGER             NOT NULL,
   "user"        INTEGER             NOT NULL,
-  FOREIGN KEY ("source")  REFERENCES "Channels"("id"),
-  FOREIGN KEY ("target")  REFERENCES "Channels"("id"),
-  FOREIGN KEY ("webhook") REFERENCES "Webhooks"("id")
+  FOREIGN KEY ("source")  REFERENCES "Channels"("id") ON DELETE CASCADE,
+  FOREIGN KEY ("target")  REFERENCES "Channels"("id") ON DELETE CASCADE,
+  FOREIGN KEY ("webhook") REFERENCES "Webhooks"("id") ON DELETE CASCADE
 );
