@@ -17,3 +17,4 @@ serenity = {version = "0.10", default-features = false, features = ["utils", "ca
 sqlx = {version = "0.5.10", features = ["macros", "runtime-tokio-rustls", "sqlite"]}
 regex = "1.5"
 sublime_fuzzy = "0.7.0"
+anyhow = "1.0.53"
