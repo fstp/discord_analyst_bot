@@ -562,7 +562,7 @@ impl EventHandler for Handler {
                     .create_application_command(|command| {
                         command
                             .name("disconnect")
-                            .description("Disconnect a source channel from a target channel")
+                            .description("Disconnect one target channel from a source channel")
                             .create_option(|option| {
                                 option
                                     .name("source")
@@ -578,6 +578,19 @@ impl EventHandler for Handler {
                                     .kind(ApplicationCommandOptionType::String)
                                     .required(true)
                                     .set_autocomplete(true)
+                            })
+                    })
+                    .create_application_command(|command| {
+                        command
+                            .name("disconnect-all")
+                            .description("Disconnect all target channels from a source channel")
+                            .create_option(|option| {
+                                option
+                                    .name("source")
+                                    .description("Source channel")
+                                    .kind(ApplicationCommandOptionType::Channel)
+                                    .required(true)
+                                //.set_autocomplete(true)
                             })
                     })
             })
@@ -1221,6 +1234,33 @@ async fn handle_disconnect_command(
     Ok(CommandResponse { title, msg })
 }
 
+async fn handle_disconnect_all_command(
+    db: &SqlitePool,
+    command: &ApplicationCommandInteraction,
+) -> Result<CommandResponse> {
+    let options = &command.data.options;
+    let source_channel = get_channel_opt("source", options)?;
+    let source = source_channel.id.0 as i64;
+    let user = command.user.id.0 as i64;
+
+    sqlx::query!(
+        "DELETE FROM Connections WHERE source = ? AND user = ?",
+        source,
+        user
+    )
+    .execute(db)
+    .await
+    .map_err(|e| Error::new(e).context("Failed to delete connections in the database"))?;
+
+    let title = "Disconnected All".to_owned();
+    let msg = format!(
+        "Source: <#{}>",
+        source,
+    );
+    Ok(CommandResponse { title, msg })
+}
+
+
 async fn handle_application_command(
     db: &SqlitePool,
     command: &ApplicationCommandInteraction,
@@ -1229,6 +1269,7 @@ async fn handle_application_command(
     let result = match command.data.name.as_str() {
         "connect" => handle_connect_command(db, command, ctx).await,
         "disconnect" => handle_disconnect_command(db, command).await,
+        "disconnect-all" => handle_disconnect_all_command(db, command).await,
         _ => Err(anyhow!(
             "Unknown command\n**{}**",
             command.data.name.as_str()
