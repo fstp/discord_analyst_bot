@@ -593,6 +593,19 @@ impl EventHandler for Handler {
                                 //.set_autocomplete(true)
                             })
                     })
+                    .create_application_command(|command| {
+                        command
+                            .name("list-connections")
+                            .description("List all the active connections for a particular server")
+                            .create_option(|option| {
+                                option
+                                    .name("server")
+                                    .description("Server name")
+                                    .kind(ApplicationCommandOptionType::String)
+                                    .required(true)
+                                    .set_autocomplete(true)
+                            })
+                    })
             })
             .await;
             let guild_name = id.name(&ctx).await.unwrap();
@@ -627,12 +640,7 @@ impl EventHandler for Handler {
             user,
         )
         .fetch_all(&self.db)
-        .and_then(|rows| async move {
-            Ok(rows
-                .into_iter()
-                .map(|row| row.webhook_id)
-                .collect())
-        })
+        .and_then(|rows| async move { Ok(rows.into_iter().map(|row| row.webhook_id).collect()) })
         .await;
         match result {
             Ok(webhook_ids) => {
@@ -843,6 +851,7 @@ async fn handle_autocomplete(
     let result: Result<AutocompleteResponse> = match autocomplete.data.name.as_str() {
         "connect" => handle_connect_autocomplete(db, autocomplete).await,
         "disconnect" => handle_disconnect_autocomplete(db, autocomplete).await,
+        "list-connections" => handle_list_connections_autocomplete(db, autocomplete).await,
         s => Err(anyhow!("Unhandled autocomplete:\n{s}")),
     };
     match result {
@@ -862,6 +871,22 @@ async fn handle_autocomplete(
     }
 }
 
+async fn handle_list_connections_autocomplete(
+    db: &SqlitePool,
+    autocomplete: &AutocompleteInteraction,
+) -> Result<AutocompleteResponse> {
+    let param_target_server = find_param("server", &autocomplete)?;
+
+    let server_name = match &param_target_server.value {
+        Some(serde_json::Value::String(input)) => input.clone(),
+        Some(val) => bail!("Unexpected parameter type (expected string):\n{:#?}", val),
+        None => bail!("No parameter value found"),
+    };
+
+    connect_target_server_autocomplete(db, &server_name).await
+}
+
+
 async fn handle_connect_autocomplete(
     db: &SqlitePool,
     autocomplete: &AutocompleteInteraction,
@@ -880,12 +905,7 @@ async fn handle_connect_autocomplete(
     } else if param_target_channel.is_ok() {
         let param_target_channel = param_target_channel.unwrap();
         if param_target_channel.focused {
-            connect_target_channel_autocomplete(
-                db,
-                &server_name,
-                &param_target_channel,
-            )
-            .await
+            connect_target_channel_autocomplete(db, &server_name, &param_target_channel).await
         } else {
             bail!("Target channel not focused")
         }
@@ -902,12 +922,8 @@ async fn handle_disconnect_autocomplete(
     let param_target_channel = find_param("target_channel", &autocomplete)?;
 
     if param_target_channel.focused {
-        disconnect_target_channel_autocomplete(
-            db,
-            &param_source_channel,
-            &param_target_channel,
-        )
-        .await
+        disconnect_target_channel_autocomplete(db, &param_source_channel, &param_target_channel)
+            .await
     } else {
         bail!("Target channel not focused")
     }
@@ -1177,7 +1193,7 @@ async fn handle_connect_command(
         true => {
             let title = "Connection created".to_owned();
             let msg = format!(
-                "Source: <#{}>\nTarget server: {}\nTarget channel: <#{}>",
+                "Source: <#{}>\nTarget server: __**{}**__\nTarget channel: <#{}>",
                 source.id,
                 target_server_name,
                 target_channel_id.as_u64()
@@ -1228,8 +1244,7 @@ async fn handle_disconnect_command(
     let title = "Disconnected".to_owned();
     let msg = format!(
         "Source: <#{}>\nServer: {target_server_name}\nTarget: <#{}>",
-        source,
-        target,
+        source, target,
     );
     Ok(CommandResponse { title, msg })
 }
@@ -1253,13 +1268,96 @@ async fn handle_disconnect_all_command(
     .map_err(|e| Error::new(e).context("Failed to delete connections in the database"))?;
 
     let title = "Disconnected All".to_owned();
-    let msg = format!(
-        "Source: <#{}>",
-        source,
-    );
+    let msg = format!("Source: <#{}>", source,);
     Ok(CommandResponse { title, msg })
 }
 
+async fn handle_list_connections_command(
+    db: &SqlitePool,
+    command: &ApplicationCommandInteraction,
+) -> Result<CommandResponse> {
+    let options = &command.data.options;
+    let server_name = get_string_opt("server", options)?;
+
+    #[derive(Debug)]
+    struct Connection {
+        source: i64,
+        target: i64,
+        source_guild: String,
+        target_guild: String,
+    }
+
+    impl From<Connection> for String {
+        fn from(c: Connection) -> Self {
+            format!(
+                "> Source: [__**{}**__] <#{}>\n> Target: [__**{}**__] <#{}>\n",
+                c.source_guild, c.source, c.target_guild, c.target
+            )
+        }
+    }
+
+    let mut connections: Vec<Connection> = sqlx::query!(
+        "
+        SELECT\n\
+        source as \"source: i64\",\n\
+        target as \"target: i64\",\n\
+        source_guild.name as source_guild,\n\
+        target_guild.name as target_guild\n\
+        FROM Connections\n\
+        JOIN Channels source_channel\n\
+        ON Connections.source = source_channel.id\n\
+        JOIN Guilds source_guild\n\
+        ON source_guild.id = source_channel.guild\n\
+        JOIN Channels target_channel\n\
+        ON Connections.target = target_channel.id\n\
+        JOIN Guilds target_guild\n\
+        ON target_guild.id = target_channel.guild\n\
+        WHERE source_guild = ? OR target_guild = ?
+        ",
+        server_name,
+        server_name
+    )
+    .fetch_all(db)
+    .and_then(|records| async {
+        Ok(records
+            .into_iter()
+            .map(|record| Connection {
+                source: record.source,
+                target: record.target,
+                source_guild: record.source_guild,
+                target_guild: record.target_guild,
+            })
+            .collect::<Vec<Connection>>())
+    })
+    .await
+    .map_err(|e| anyhow!(e).context("Failed to retrieve incoming connections from the database"))?;
+
+    connections.sort_by(|a, b| a.source_guild.cmp(&b.source_guild));
+
+    let (outgoing, incoming): (Vec<Connection>, Vec<Connection>) = connections
+        .into_iter()
+        .partition(|c| &c.source_guild == server_name);
+
+    let outgoing_msg: String = outgoing
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    let incoming_msg: String = incoming
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    Ok(CommandResponse {
+        title: "Connection List".to_owned(),
+        msg: format!(
+            "__**Outgoing:**__\n{}\n__**Incoming:**__\n{}",
+            outgoing_msg, incoming_msg
+        ),
+    })
+}
 
 async fn handle_application_command(
     db: &SqlitePool,
@@ -1270,6 +1368,7 @@ async fn handle_application_command(
         "connect" => handle_connect_command(db, command, ctx).await,
         "disconnect" => handle_disconnect_command(db, command).await,
         "disconnect-all" => handle_disconnect_all_command(db, command).await,
+        "list-connections" => handle_list_connections_command(db, command).await,
         _ => Err(anyhow!(
             "Unknown command\n**{}**",
             command.data.name.as_str()
