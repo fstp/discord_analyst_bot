@@ -44,6 +44,10 @@ struct CommandResponse {
     msg: String,
 }
 
+struct AutocompleteResponse {
+    options: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 struct Server {
     name: String,
@@ -449,14 +453,12 @@ async fn create_server_mapping(db: &SqlitePool, ctx: &ClientContext, guilds: &Ve
     }
 }
 
-async fn get_guild_names(db: &SqlitePool) -> Vec<String> {
+async fn get_guild_names(db: &SqlitePool) -> Result<Vec<String>> {
     sqlx::query!("SELECT Guilds.name FROM Guilds")
         .fetch_all(db)
+        .and_then(|result| async { Ok(result.into_iter().map(|record| record.name).collect()) })
         .await
-        .unwrap()
-        .into_iter()
-        .map(|record| record.name)
-        .collect()
+        .map_err(|e| anyhow!(e).context("Failed to retrieve guild names from the database"))
 }
 
 async fn get_guild_ids(db: &SqlitePool) -> Vec<GuildId> {
@@ -469,10 +471,7 @@ async fn get_guild_ids(db: &SqlitePool) -> Vec<GuildId> {
         .collect()
 }
 
-async fn get_channel_names(
-    server_name: &String,
-    db: &SqlitePool,
-) -> Result<Vec<String>, sqlx::Error> {
+async fn get_channel_names(server_name: &String, db: &SqlitePool) -> Result<Vec<String>> {
     sqlx::query!(
         "
         SELECT Channels.name\n\
@@ -482,11 +481,9 @@ async fn get_channel_names(
         server_name
     )
     .fetch_all(db)
-    .and_then(|records| async {
-        let names: Vec<String> = records.into_iter().map(|record| record.name).collect();
-        Ok(names)
-    })
+    .and_then(|records| async { Ok(records.into_iter().map(|record| record.name).collect()) })
     .await
+    .map_err(|e| anyhow!(e).context("Failed to retrieve channel names from database"))
 }
 
 struct Handler {
@@ -607,8 +604,7 @@ impl EventHandler for Handler {
         }
         let source = msg.channel_id.0 as i64;
         let user = msg.author.id.0 as i64;
-        println!("source: {source}, user: {user}");
-        let result = sqlx::query!(
+        let result: Result<Vec<i64>, sqlx::Error> = sqlx::query!(
             "
             SELECT webhook as \"webhook_id: i64\"\n\
             FROM Connections\n\
@@ -622,7 +618,7 @@ impl EventHandler for Handler {
             Ok(rows
                 .into_iter()
                 .map(|row| row.webhook_id)
-                .collect::<Vec<i64>>())
+                .collect())
         })
         .await;
         match result {
@@ -662,14 +658,14 @@ impl EventHandler for Handler {
                 handle_application_command(&self.db, &command, &ctx).await
             }
             Interaction::Autocomplete(autocomplete) => {
-                handle_autocomplete(&self.db, autocomplete, ctx).await
+                handle_autocomplete(&self.db, &autocomplete, &ctx).await
             }
             _ => println!("Received unknown interaction:\n{:#?}", interaction),
         }
     }
 }
 
-async fn send_empty_response(autocomplete: &AutocompleteInteraction, ctx: ClientContext) {
+async fn send_empty_response(autocomplete: &AutocompleteInteraction, ctx: &ClientContext) {
     autocomplete
         .create_autocomplete_response(&ctx, move |rsp| rsp)
         .await
@@ -680,76 +676,52 @@ async fn disconnect_target_channel_autocomplete(
     db: &SqlitePool,
     source_channel: &ApplicationCommandInteractionDataOption,
     target_channel: &ApplicationCommandInteractionDataOption,
-    autocomplete: &AutocompleteInteraction,
-    ctx: ClientContext,
-) {
+) -> Result<AutocompleteResponse> {
     let target_channel = match &target_channel.value {
         Some(serde_json::Value::String(input)) => input.clone(),
-        _ => {
-            println!("(disconnect) Failed to read target channel");
-            send_empty_response(autocomplete, ctx).await;
-            return;
-        }
+        Some(val) => bail!("Expected option to be of type string:\n{:#?}", val),
+        None => bail!("Did not find option \"target_channel\""),
     };
 
     let source_channel: i64 = match &source_channel.value {
-        Some(serde_json::Value::String(input)) => match input.parse() {
-            Ok(id) => id,
-            Err(why) => {
-                println!("(disconnect) Failed to parse source channel: {why}");
-                send_empty_response(autocomplete, ctx).await;
-                return;
-            }
-        },
-        _ => {
-            println!("(disconnect) Source channel option is empty");
-            send_empty_response(autocomplete, ctx).await;
-            return;
-        }
+        Some(serde_json::Value::String(input)) => input
+            .parse()
+            .context("Failed to parse \"source_channel\"")?,
+        Some(val) => bail!("Expected option to be of type string:\n{:#?}", val),
+        None => bail!("Did not find option \"target_channel\""),
     };
 
-    let channels: Vec<String> = {
-        let result = sqlx::query!(
-            "
-            SELECT\n\
-            Guilds.name as guild_name,\n\
-            Channels.name as channel_name\n\
-            FROM Channels\n\
-            JOIN Connections\n\
-            ON Channels.id = Connections.target\n\
-            JOIN Guilds\n\
-            ON Channels.guild = Guilds.id\n\
-            WHERE Connections.source = ?\n\
-            ORDER BY Guilds.name
-            ",
-            source_channel
-        )
-        .fetch_all(db)
-        .and_then(|rows| async move {
-            Ok(rows
-                .into_iter()
-                .map(|row| format!("[{}] {}", row.guild_name, row.channel_name))
-                .collect::<Vec<String>>())
-        })
-        .await;
-        match result {
-            Ok(channels) => channels,
-            Err(why) => {
-                println!("(disconnect) Database error when trying to autocomplete: {why}");
-                send_empty_response(autocomplete, ctx).await;
-                return;
-            }
-        }
-    };
+    let channels: Vec<String> = sqlx::query!(
+        "
+        SELECT\n\
+        Guilds.name as guild_name,\n\
+        Channels.name as channel_name\n\
+        FROM Channels\n\
+        JOIN Connections\n\
+        ON Channels.id = Connections.target\n\
+        JOIN Guilds\n\
+        ON Channels.guild = Guilds.id\n\
+        WHERE Connections.source = ?\n\
+        ORDER BY Guilds.name
+        ",
+        source_channel
+    )
+    .fetch_all(db)
+    .and_then(|rows| async move {
+        Ok(rows
+            .into_iter()
+            .map(|row| format!("[{}] {}", row.guild_name, row.channel_name))
+            .collect())
+    })
+    .await
+    .context("Failed to retrieve target channel names from the database")?;
 
     if channels.is_empty() {
-        send_empty_response(autocomplete, ctx).await;
-        return;
+        bail!("No target channels found")
     }
 
     // Matching score, lower score is a better match.
     let mut matching: Vec<(isize, String)> = channels
-        .clone()
         .into_iter()
         .map(|s| {
             let score = match best_match(target_channel.as_str(), s.as_str()) {
@@ -760,62 +732,32 @@ async fn disconnect_target_channel_autocomplete(
         })
         .collect();
 
-    if matching.is_empty() {
-        send_empty_response(autocomplete, ctx).await;
-        return;
-    }
-
     matching.sort();
     matching.drain(cmp::min(25, matching.len())..);
 
-    autocomplete
-        .create_autocomplete_response(&ctx, move |rsp| {
-            for (_score, name) in matching {
-                rsp.add_string_choice(name.as_str(), name.as_str());
-            }
-            rsp
-        })
-        .await
-        .unwrap()
+    Ok(AutocompleteResponse {
+        options: matching.into_iter().map(|(_score, name)| name).collect(),
+    })
 }
 
 async fn connect_target_channel_autocomplete(
     db: &SqlitePool,
     server_name: &String,
     opt: &ApplicationCommandInteractionDataOption,
-    autocomplete: &AutocompleteInteraction,
-    ctx: ClientContext,
-) {
+) -> Result<AutocompleteResponse> {
     if server_name.trim().is_empty() {
-        send_empty_response(autocomplete, ctx).await;
-        return;
+        bail!("No server name");
     }
-
-    let channels = match get_channel_names(server_name, db).await {
-        Ok(channels) => channels,
-        Err(why) => {
-            println!(
-                "{}\nFailed to retreive channels for server {}\nWhy: {}",
-                style("Error:").red(),
-                style(server_name).cyan(),
-                style(why).cyan()
-            );
-            send_empty_response(autocomplete, ctx).await;
-            return;
-        }
-    };
 
     let channel_name = match &opt.value {
         Some(serde_json::Value::String(input)) => input.clone(),
-        _ => {
-            send_empty_response(autocomplete, ctx).await;
-            return;
-        }
+        _ => bail!("Expected option to be of type string:\n{:#?}", opt.value),
     };
+
+    let channels = get_channel_names(server_name, db).await?;
 
     // Matching score, lower score is a better match.
     let mut matching: Vec<(isize, String)> = channels
-        .clone()
         .into_iter()
         .map(|s| {
             let score = match best_match(channel_name.as_str(), s.as_str()) {
@@ -827,35 +769,25 @@ async fn connect_target_channel_autocomplete(
         .collect();
 
     if matching.is_empty() {
-        send_empty_response(autocomplete, ctx).await;
-        return;
+        bail!("No matching channels");
     }
 
     matching.sort();
     matching.drain(cmp::min(25, matching.len())..);
 
-    autocomplete
-        .create_autocomplete_response(&ctx, move |rsp| {
-            for (_score, name) in matching {
-                rsp.add_string_choice(name.as_str(), name.as_str());
-            }
-            rsp
-        })
-        .await
-        .unwrap()
+    Ok(AutocompleteResponse {
+        options: matching.into_iter().map(|(_score, name)| name).collect(),
+    })
 }
 
 async fn connect_target_server_autocomplete(
     db: &SqlitePool,
     server_name: &String,
-    autocomplete: &AutocompleteInteraction,
-    ctx: ClientContext,
-) {
-    let servers = get_guild_names(db).await;
+) -> Result<AutocompleteResponse> {
+    let servers = get_guild_names(db).await?;
 
     // Matching score, lower score is a better match.
     let mut matching: Vec<(isize, String)> = servers
-        .clone()
         .into_iter()
         .map(|s| {
             let score = match best_match(server_name.as_str(), s.as_str()) {
@@ -867,115 +799,113 @@ async fn connect_target_server_autocomplete(
         .collect();
 
     if matching.is_empty() {
-        send_empty_response(autocomplete, ctx).await;
-        return;
+        bail!("No guilds found");
     }
 
     matching.sort();
     matching.drain(cmp::min(25, matching.len())..);
 
-    autocomplete
-        .create_autocomplete_response(&ctx, move |rsp| {
-            for (_score, name) in matching {
-                rsp.add_string_choice(name.as_str(), name.as_str());
-            }
-            rsp
-        })
-        .await
-        .unwrap()
+    Ok(AutocompleteResponse {
+        options: matching.into_iter().map(|(_score, name)| name).collect(),
+    })
 }
 
-fn find_opt<'a>(
+fn find_param<'a>(
     name: &str,
     autocomplete: &'a AutocompleteInteraction,
-) -> Option<&'a ApplicationCommandInteractionDataOption> {
+) -> Result<&'a ApplicationCommandInteractionDataOption> {
     autocomplete
         .data
         .options
         .iter()
         .find(|opt| opt.name == name)
+        .ok_or(anyhow!("Did not find autocomplete parameter: {name}"))
 }
 
 async fn handle_autocomplete(
     db: &SqlitePool,
-    autocomplete: AutocompleteInteraction,
-    ctx: ClientContext,
+    autocomplete: &AutocompleteInteraction,
+    ctx: &ClientContext,
 ) {
-    match autocomplete.data.name.as_str() {
-        "connect" => handle_connect_autocomplete(autocomplete, ctx, db).await,
-        "disconnect" => handle_disconnect_autocomplete(autocomplete, ctx, db).await,
-        s => println!("Unhandled autocomplete: {s}"),
+    let result: Result<AutocompleteResponse> = match autocomplete.data.name.as_str() {
+        "connect" => handle_connect_autocomplete(db, autocomplete).await,
+        "disconnect" => handle_disconnect_autocomplete(db, autocomplete).await,
+        s => Err(anyhow!("Unhandled autocomplete:\n{s}")),
+    };
+    match result {
+        Ok(rsp) => autocomplete
+            .create_autocomplete_response(&ctx, move |c| {
+                for name in rsp.options {
+                    c.add_string_choice(name.as_str(), name.as_str());
+                }
+                c
+            })
+            .await
+            .unwrap(),
+        Err(e) => {
+            println!("{:?}", e);
+            send_empty_response(autocomplete, ctx).await;
+        }
     }
 }
 
 async fn handle_connect_autocomplete(
-    autocomplete: AutocompleteInteraction,
-    ctx: ClientContext,
     db: &SqlitePool,
-) {
-    let param_target_server = find_opt("target_server", &autocomplete);
-    let param_target_channel = find_opt("target_channel", &autocomplete);
-    if param_target_server.is_none() {
-        send_empty_response(&autocomplete, ctx).await;
-        return;
-    }
-    let param_target_server = param_target_server.unwrap();
+    autocomplete: &AutocompleteInteraction,
+) -> Result<AutocompleteResponse> {
+    let param_target_server = find_param("target_server", &autocomplete)?;
+    let param_target_channel = find_param("target_channel", &autocomplete);
+
     let server_name = match &param_target_server.value {
         Some(serde_json::Value::String(input)) => input.clone(),
-        _ => {
-            send_empty_response(&autocomplete, ctx).await;
-            return;
-        }
+        Some(val) => bail!("Unexpected parameter type (expected string):\n{:#?}", val),
+        None => bail!("No parameter value found"),
     };
+
     if param_target_server.focused {
-        connect_target_server_autocomplete(db, &server_name, &autocomplete, ctx).await;
-    } else if param_target_channel.is_some() && param_target_channel.unwrap().focused {
+        connect_target_server_autocomplete(db, &server_name).await
+    } else if param_target_channel.is_ok() {
         let param_target_channel = param_target_channel.unwrap();
-        connect_target_channel_autocomplete(
-            db,
-            &server_name,
-            &param_target_channel,
-            &autocomplete,
-            ctx,
-        )
-        .await;
+        if param_target_channel.focused {
+            connect_target_channel_autocomplete(
+                db,
+                &server_name,
+                &param_target_channel,
+            )
+            .await
+        } else {
+            bail!("Target channel not focused")
+        }
+    } else {
+        bail!("Invalid parameter focus")
     }
 }
 
 async fn handle_disconnect_autocomplete(
-    autocomplete: AutocompleteInteraction,
-    ctx: ClientContext,
     db: &SqlitePool,
-) {
-    let param_source_channel = find_opt("source", &autocomplete);
-    let param_target_channel = find_opt("target_channel", &autocomplete);
+    autocomplete: &AutocompleteInteraction,
+) -> Result<AutocompleteResponse> {
+    let param_source_channel = find_param("source", &autocomplete)?;
+    let param_target_channel = find_param("target_channel", &autocomplete)?;
 
-    if param_source_channel.is_some()
-        && param_target_channel.is_some()
-        && param_target_channel.unwrap().focused
-    {
-        let param_source_channel = param_source_channel.unwrap();
-        let param_target_channel = param_target_channel.unwrap();
+    if param_target_channel.focused {
         disconnect_target_channel_autocomplete(
             db,
             &param_source_channel,
             &param_target_channel,
-            &autocomplete,
-            ctx,
         )
-        .await;
+        .await
+    } else {
+        bail!("Target channel not focused")
     }
 }
 
-async fn ok_command_response<S1, S2>(
-    title: S1,
-    msg: S2,
+async fn ok_command_response(
+    title: &impl Display,
+    msg: &impl Display,
     command: &ApplicationCommandInteraction,
     ctx: &ClientContext,
-) where
-    S1: Into<String> + Display,
-    S2: Into<String> + Display,
-{
+) {
     if let Err(why) = command
         .create_interaction_response(&ctx.http, |response| {
             response
@@ -995,13 +925,11 @@ async fn ok_command_response<S1, S2>(
     }
 }
 
-async fn error_command_response<S>(
-    msg: S,
+async fn error_command_response(
+    msg: &impl Display,
     command: &ApplicationCommandInteraction,
     ctx: &ClientContext,
-) where
-    S: Into<String> + Display,
-{
+) {
     if let Err(why) = command
         .create_interaction_response(&ctx.http, |response| {
             response
@@ -1249,7 +1177,7 @@ async fn handle_connect_command(
 
 async fn handle_disconnect_command(
     db: &SqlitePool,
-    command: &ApplicationCommandInteraction
+    command: &ApplicationCommandInteraction,
 ) -> Result<CommandResponse> {
     let options = &command.data.options;
     let source_channel = get_channel_opt("source", options)?;
@@ -1286,10 +1214,11 @@ async fn handle_disconnect_command(
 
     let title = "Disconnected".to_owned();
     let msg = format!(
-        "Source: <#{}>\nServer: {target_server_name}\nTarget: {target_channel_name}",
-        source
+        "Source: <#{}>\nServer: {target_server_name}\nTarget: <#{}>",
+        source,
+        target,
     );
-    Ok(CommandResponse{title, msg})
+    Ok(CommandResponse { title, msg })
 }
 
 async fn handle_application_command(
@@ -1297,7 +1226,7 @@ async fn handle_application_command(
     command: &ApplicationCommandInteraction,
     ctx: &ClientContext,
 ) {
-    let result: Result<CommandResponse> = match command.data.name.as_str() {
+    let result = match command.data.name.as_str() {
         "connect" => handle_connect_command(db, command, ctx).await,
         "disconnect" => handle_disconnect_command(db, command).await,
         _ => Err(anyhow!(
@@ -1306,10 +1235,10 @@ async fn handle_application_command(
         )),
     };
     match result {
-        Ok(rsp) => ok_command_response(rsp.title, rsp.msg, command, ctx).await,
-        Err(why) => {
-            println!("{:?}", why);
-            error_command_response(why.to_string(), command, ctx).await;
+        Ok(rsp) => ok_command_response(&rsp.title, &rsp.msg, command, ctx).await,
+        Err(e) => {
+            println!("{:?}", e);
+            error_command_response(&e.to_string(), command, ctx).await;
         }
     }
 }
