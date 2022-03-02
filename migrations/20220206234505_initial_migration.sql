@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS "Users" (
 
 CREATE TABLE IF NOT EXISTS "Guilds" (
   "id"          INTEGER PRIMARY KEY NOT NULL,
-  "name"        TEXT                NOT NULL
+  "name"        TEXT                NOT NULL,
+  "is_banned"   BOOLEAN             NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS "Channels" (

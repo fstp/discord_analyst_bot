@@ -11,7 +11,7 @@ use serenity::{
     async_trait,
     client::Context as ClientContext, // Alias to avoid name collision with anyhow::Context
     model::{
-        channel::{ChannelType, GuildChannel, Message, PartialChannel},
+        channel::{ChannelType, Embed, GuildChannel, Message, PartialChannel},
         gateway::Ready,
         id::{ChannelId, GuildId, UserId, WebhookId},
         interactions::{
@@ -597,6 +597,13 @@ impl EventHandler for Handler {
                         command
                             .name("list-connections")
                             .description("List all the active connections for a particular server")
+                    })
+                    .create_application_command(|command| {
+                        command
+                            .name("wipe")
+                            .description(
+                                "[WARNING] Will remove ALL connections to/from the selected server",
+                            )
                             .create_option(|option| {
                                 option
                                     .name("server")
@@ -625,50 +632,10 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: ClientContext, msg: Message) {
-        if msg.author.bot == true {
-            return;
-        }
-        let source = msg.channel_id.0 as i64;
-        let user = msg.author.id.0 as i64;
-        let result: Result<Vec<i64>, sqlx::Error> = sqlx::query!(
-            "
-            SELECT webhook as \"webhook_id: i64\"\n\
-            FROM Connections\n\
-            WHERE Connections.source = ? AND Connections.user = ?
-            ",
-            source,
-            user,
-        )
-        .fetch_all(&self.db)
-        .and_then(|rows| async move { Ok(rows.into_iter().map(|row| row.webhook_id).collect()) })
-        .await;
-        match result {
-            Ok(webhook_ids) => {
-                for id in webhook_ids {
-                    let id = WebhookId(id as u64);
-                    match id.to_webhook(&ctx).await {
-                        Ok(webhook) => {
-                            let result = webhook
-                                .execute(&ctx, false, |w| {
-                                    w.content(&msg.content);
-                                    w
-                                })
-                                .await;
-                            match result {
-                                Err(why) => println!("Failed to execute webhook: {why}"),
-                                _ => (),
-                            }
-                        }
-                        Err(why) => {
-                            println!("Discord API error when trying to resolve webhook: {why}");
-                            return;
-                        }
-                    }
-                }
-            }
-            Err(why) => {
-                println!("Database error when trying to retrieve webhook: {why}");
-                return;
+        match handle_message(&self.db, &ctx, &msg).await {
+            Ok(_) => (),
+            Err(e) => {
+                println!("{:?}", e)
             }
         }
     }
@@ -684,6 +651,51 @@ impl EventHandler for Handler {
             _ => println!("Received unknown interaction:\n{:#?}", interaction),
         }
     }
+}
+
+async fn handle_message(db: &SqlitePool, ctx: &ClientContext, msg: &Message) -> Result<()> {
+    if msg.author.bot == true {
+        return Ok(());
+    }
+
+    let source = msg.channel_id.0 as i64;
+    let user = msg.author.id.0 as i64;
+    let webhook_ids: Vec<WebhookId> = sqlx::query!(
+        "
+        SELECT webhook as \"webhook_id: i64\"\n\
+        FROM Connections\n\
+        WHERE Connections.source = ? AND Connections.user = ?
+        ",
+        source,
+        user,
+    )
+    .fetch_all(db)
+    .and_then(|rows| async move {
+        Ok(rows
+            .into_iter()
+            .map(|row| WebhookId(row.webhook_id as u64))
+            .collect())
+    })
+    .map_err(|e| Error::new(e).context("Failed to retrieve webhook ids from database"))
+    .await?;
+
+    for id in webhook_ids {
+        let webhook = id.to_webhook(&ctx).await?;
+        webhook
+            .execute(&ctx, false, |w| {
+                //w.content(&msg.content);
+                let embed = Embed::fake(|e| {
+                    e /*.author(|a| a.name(username).url(user_url).icon_url(icon_url))*/
+                        .color(Color::BLUE)
+                        .description(&msg.content)
+                });
+                w.embeds(vec![embed])
+            })
+            .await
+            .context(format!("Failed to execute webhook:\n{:#?}", webhook))?;
+    }
+
+    Ok(())
 }
 
 async fn send_empty_response(autocomplete: &AutocompleteInteraction, ctx: &ClientContext) {
@@ -851,7 +863,7 @@ async fn handle_autocomplete(
     let result: Result<AutocompleteResponse> = match autocomplete.data.name.as_str() {
         "connect" => handle_connect_autocomplete(db, autocomplete).await,
         "disconnect" => handle_disconnect_autocomplete(db, autocomplete).await,
-        "list-connections" => handle_list_connections_autocomplete(db, autocomplete).await,
+        "wipe" => handle_wipe_autocomplete(db, autocomplete).await,
         s => Err(anyhow!("Unhandled autocomplete:\n{s}")),
     };
     match result {
@@ -871,7 +883,7 @@ async fn handle_autocomplete(
     }
 }
 
-async fn handle_list_connections_autocomplete(
+async fn handle_wipe_autocomplete(
     db: &SqlitePool,
     autocomplete: &AutocompleteInteraction,
 ) -> Result<AutocompleteResponse> {
@@ -885,7 +897,6 @@ async fn handle_list_connections_autocomplete(
 
     connect_target_server_autocomplete(db, &server_name).await
 }
-
 
 async fn handle_connect_autocomplete(
     db: &SqlitePool,
@@ -1276,10 +1287,6 @@ async fn handle_list_connections_command(
     db: &SqlitePool,
     command: &ApplicationCommandInteraction,
 ) -> Result<CommandResponse> {
-    let options = &command.data.options;
-    let server_name = get_string_opt("server", options)?;
-
-    #[derive(Debug)]
     struct Connection {
         source: i64,
         target: i64,
@@ -1290,15 +1297,17 @@ async fn handle_list_connections_command(
     impl From<Connection> for String {
         fn from(c: Connection) -> Self {
             format!(
-                "> Source: [__**{}**__] <#{}>\n> Target: [__**{}**__] <#{}>\n",
-                c.source_guild, c.source, c.target_guild, c.target
+                "> <#{}> => <#{}> **({})**",
+                c.source, c.target, c.target_guild
             )
         }
     }
 
-    let mut connections: Vec<Connection> = sqlx::query!(
+    let user = command.user.id.0 as i64;
+    let connections: Vec<Connection> = sqlx::query!(
         "
         SELECT\n\
+        user as \"user: i64\",\n\
         source as \"source: i64\",\n\
         target as \"target: i64\",\n\
         source_guild.name as source_guild,\n\
@@ -1312,10 +1321,9 @@ async fn handle_list_connections_command(
         ON Connections.target = target_channel.id\n\
         JOIN Guilds target_guild\n\
         ON target_guild.id = target_channel.guild\n\
-        WHERE source_guild = ? OR target_guild = ?
+        WHERE user = ?
         ",
-        server_name,
-        server_name
+        user
     )
     .fetch_all(db)
     .and_then(|records| async {
@@ -1330,33 +1338,77 @@ async fn handle_list_connections_command(
             .collect::<Vec<Connection>>())
     })
     .await
-    .map_err(|e| anyhow!(e).context("Failed to retrieve incoming connections from the database"))?;
+    .map_err(|e| {
+        anyhow!(e).context("Failed to retrieve connections for server from the database")
+    })?;
 
-    connections.sort_by(|a, b| a.source_guild.cmp(&b.source_guild));
+    let grouped = {
+        let mut grouped: HashMap<String, Vec<Connection>> = HashMap::default();
+        for c in connections {
+            match grouped.get_mut(&c.source_guild) {
+                Some(val) => val.push(c),
+                None => {
+                    let _ = grouped.insert(c.source_guild.clone(), vec![c]);
+                }
+            };
+        }
+        grouped
+    };
 
-    let (outgoing, incoming): (Vec<Connection>, Vec<Connection>) = connections
+    let msg = grouped
         .into_iter()
-        .partition(|c| &c.source_guild == server_name);
-
-    let outgoing_msg: String = outgoing
-        .into_iter()
-        .map(String::from)
+        .map(|(k, cs)| {
+            let s = cs
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<String>>()
+                .join("\n");
+            format!("__**{}**__\n{}", k, s)
+        })
         .collect::<Vec<String>>()
-        .join("\n");
-
-    let incoming_msg: String = incoming
-        .into_iter()
-        .map(String::from)
-        .collect::<Vec<String>>()
-        .join("\n");
+        .join("\n\n");
 
     Ok(CommandResponse {
         title: "Connection List".to_owned(),
-        msg: format!(
-            "__**Outgoing:**__\n{}\n__**Incoming:**__\n{}",
-            outgoing_msg, incoming_msg
-        ),
+        msg,
     })
+}
+
+async fn handle_wipe_command(
+    db: &SqlitePool,
+    command: &ApplicationCommandInteraction,
+) -> Result<CommandResponse> {
+    let options = &command.data.options;
+    let server_name = get_string_opt("server", options)?;
+    let user = command.user.id.0 as i64;
+
+    sqlx::query!(
+        "
+        DELETE FROM Connections\n\
+        WHERE Connections.id in (\n\
+            SELECT Connections.id from Connections\n\
+            JOIN Channels source_channel\n\
+            ON Connections.source = source_channel.id\n\
+            JOIN Guilds source_guild\n\
+            ON source_guild.id = source_channel.guild\n\
+            JOIN Channels target_channel\n\
+            ON Connections.target = target_channel.id\n\
+            JOIN Guilds target_guild\n\
+            ON target_guild.id = target_channel.guild\n\
+            WHERE (source_guild.name = ? OR target_guild.name = ?) AND user = ?\n\
+        );
+        ",
+        server_name,
+        server_name,
+        user
+    )
+    .execute(db)
+    .await
+    .map_err(|e| Error::new(e).context("Failed to wipe connections for server in the database"))?;
+
+    let title = "Wiped".to_owned();
+    let msg = format!("Removed all connections: __**{server_name}**__");
+    Ok(CommandResponse { title, msg })
 }
 
 async fn handle_application_command(
@@ -1369,6 +1421,7 @@ async fn handle_application_command(
         "disconnect" => handle_disconnect_command(db, command).await,
         "disconnect-all" => handle_disconnect_all_command(db, command).await,
         "list-connections" => handle_list_connections_command(db, command).await,
+        "wipe" => handle_wipe_command(db, command).await,
         _ => Err(anyhow!(
             "Unknown command\n**{}**",
             command.data.name.as_str()
