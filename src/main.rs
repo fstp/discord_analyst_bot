@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, Context, Error, Result};
 use console::style;
 use dialoguer::Input;
-use futures::TryFutureExt;
+use futures::{TryFutureExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serenity::{
@@ -420,37 +420,42 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
     return rsp;
 }
 
-async fn create_server_mapping(db: &SqlitePool, ctx: &ClientContext, guilds: &Vec<GuildId>) {
-    for id in guilds {
-        let guild_id = id.0 as i64;
-        let name = id.name(&ctx).await.unwrap();
-        sqlx::query!(
-            "INSERT OR REPLACE INTO Guilds (id, name) VALUES (?, ?)",
-            guild_id,
-            name,
-        )
-        .execute(db)
+async fn create_server_mapping(db: &SqlitePool, ctx: &ClientContext, id: &GuildId) -> Result<()> {
+    let guild_id = id.0 as i64;
+    let name = id
+        .name(&ctx)
         .await
-        .unwrap();
+        .context(format!("Failed to get name from guild id: {guild_id}"))?;
 
-        let channels: Vec<(ChannelId, GuildChannel)> =
-            id.channels(&ctx).await.unwrap().into_iter().collect();
-        for (ch_id, ch) in channels {
-            if ch.kind == ChannelType::Text {
-                let channel_id = ch_id.0 as i64;
-                let name = format!("#{}", ch.name);
-                sqlx::query!(
-                    "INSERT OR REPLACE INTO Channels (id, name, guild) VALUES (?, ?, ?)",
-                    channel_id,
-                    name,
-                    guild_id,
-                )
-                .execute(db)
-                .await
-                .unwrap();
-            }
+    sqlx::query!(
+        "INSERT INTO Guilds (id, name, is_banned) VALUES (?, ?, false)",
+        guild_id,
+        name,
+    )
+    .execute(db)
+    .await
+    .map_err(|e| {
+        Error::new(e).context(format!("Failed to insert guild into the database: {name}"))
+    })?;
+
+    let channels: Vec<(ChannelId, GuildChannel)> =
+        id.channels(&ctx).await.unwrap().into_iter().collect();
+    for (ch_id, ch) in channels {
+        if ch.kind == ChannelType::Text {
+            let channel_id = ch_id.0 as i64;
+            let name = format!("#{}", ch.name);
+            sqlx::query!(
+                "INSERT INTO Channels (id, name, guild) VALUES (?, ?, ?)",
+                channel_id,
+                name,
+                guild_id,
+            )
+            .execute(db)
+            .await
+            .unwrap();
         }
     }
+    Ok(())
 }
 
 async fn get_guild_names(db: &SqlitePool) -> Result<Vec<String>> {
@@ -524,11 +529,21 @@ impl EventHandler for Handler {
     // shard is booted, and a READY payload is sent by Discord. This payload
     // contains data like the current user's guild Ids, current user data,
     // private channels, and more.
-    async fn ready(&self, ctx: ClientContext, ready: Ready) {
+    async fn ready(&self, _ctx: ClientContext, ready: Ready) {
         println!("{} is connected to Discord", ready.user.name);
-        let guild_ids = get_guild_ids(&self.db).await;
-        for id in guild_ids {
-            let result = GuildId::set_application_commands(&id, &ctx.http, |commands| {
+    }
+
+    async fn cache_ready(&self, ctx: ClientContext, guilds: Vec<GuildId>) {
+        println!("Cache is ready");
+        for id in &guilds {
+            match create_server_mapping(&self.db, &ctx, &id).await {
+                Ok(_) => (),
+                Err(e) => println!("{:?}", e),
+            }
+        }
+        println!("Server mapping created");
+        for id in &guilds {
+            let result = GuildId::set_application_commands(id, &ctx.http, |commands| {
                 commands
                     .create_application_command(|command| {
                         command
@@ -540,7 +555,7 @@ impl EventHandler for Handler {
                                     .description("Source channel")
                                     .kind(ApplicationCommandOptionType::Channel)
                                     .required(true)
-                                //.set_autocomplete(true)
+                                    .channel_types(&[ChannelType::Text])
                             })
                             .create_option(|option| {
                                 option
@@ -569,7 +584,7 @@ impl EventHandler for Handler {
                                     .description("Source channel")
                                     .kind(ApplicationCommandOptionType::Channel)
                                     .required(true)
-                                //.set_autocomplete(true)
+                                    .channel_types(&[ChannelType::Text])
                             })
                             .create_option(|option| {
                                 option
@@ -590,7 +605,7 @@ impl EventHandler for Handler {
                                     .description("Source channel")
                                     .kind(ApplicationCommandOptionType::Channel)
                                     .required(true)
-                                //.set_autocomplete(true)
+                                    .channel_types(&[ChannelType::Text])
                             })
                     })
                     .create_application_command(|command| {
@@ -621,10 +636,7 @@ impl EventHandler for Handler {
                 Err(why) => println!("Failed to install slash commands in {guild_name}: {why}"),
             }
         }
-    }
-
-    async fn cache_ready(&self, ctx: ClientContext, guilds: Vec<GuildId>) {
-        create_server_mapping(&self.db, &ctx, &guilds).await;
+        println!("Slash commands added");
         self.cache_rdy_tx
             .send(true)
             .await
@@ -634,9 +646,7 @@ impl EventHandler for Handler {
     async fn message(&self, ctx: ClientContext, msg: Message) {
         match handle_message(&self.db, &ctx, &msg).await {
             Ok(_) => (),
-            Err(e) => {
-                println!("{:?}", e)
-            }
+            Err(e) => println!("{:?}", e),
         }
     }
 

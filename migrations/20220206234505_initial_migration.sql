@@ -1,28 +1,28 @@
 CREATE TABLE IF NOT EXISTS "Users" (
   "id"          INTEGER PRIMARY KEY NOT NULL,
   "name"        TEXT                NOT NULL,
-  "is_admin"    BOOLEAN             NOT NULL,
-  "is_banned"   BOOLEAN             NOT NULL
+  "is_admin"    BOOLEAN             NOT NULL DEFAULT false,
+  "is_banned"   BOOLEAN             NOT NULL DEFAULT false
 );
 
 CREATE TABLE IF NOT EXISTS "Guilds" (
   "id"          INTEGER PRIMARY KEY NOT NULL,
   "name"        TEXT                NOT NULL,
-  "is_banned"   BOOLEAN             NOT NULL
+  "is_banned"   BOOLEAN             NOT NULL DEFAULT false
 );
 
 CREATE TABLE IF NOT EXISTS "Channels" (
   "id"          INTEGER PRIMARY KEY NOT NULL,
   "name"        TEXT                NOT NULL,
   "guild"       INTEGER             NOT NULL,
-  FOREIGN KEY ("guild") REFERENCES "Guilds"("id")
+  FOREIGN KEY ("guild") REFERENCES "Guilds"("id") ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS "Webhooks" (
   "id"          INTEGER PRIMARY KEY NOT NULL,
   "target"      INTEGER             NOT NULL,
   "user"        INTEGER             NOT NULL,
-  FOREIGN KEY ("target") REFERENCES "Channels"("id")
+  FOREIGN KEY ("target") REFERENCES "Channels"("id") ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS "Connections" (
@@ -31,7 +31,16 @@ CREATE TABLE IF NOT EXISTS "Connections" (
   "target"      INTEGER             NOT NULL,
   "webhook"     INTEGER             NOT NULL,
   "user"        INTEGER             NOT NULL,
-  FOREIGN KEY ("source")  REFERENCES "Channels"("id"),
-  FOREIGN KEY ("target")  REFERENCES "Channels"("id"),
+  FOREIGN KEY ("source")  REFERENCES "Channels"("id") ON DELETE CASCADE,
+  FOREIGN KEY ("target")  REFERENCES "Channels"("id") ON DELETE CASCADE,
   FOREIGN KEY ("webhook") REFERENCES "Webhooks"("id")
+);
+
+CREATE TABLE IF NOT EXISTS "Mentions" (
+  "id"          INTEGER PRIMARY KEY NOT NULL,
+  "source"      INTEGER,
+  "target"      INTEGER             NOT NULL,
+  "mention"     TEXT                NOT NULL,
+  FOREIGN KEY ("source")  REFERENCES "Channels"("id") ON DELETE CASCADE,
+  FOREIGN KEY ("target")  REFERENCES "Channels"("id") ON DELETE CASCADE
 );
