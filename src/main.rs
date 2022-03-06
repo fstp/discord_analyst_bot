@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, Context, Error, Result};
 use console::style;
 use dialoguer::Input;
-use futures::{TryFutureExt};
+use futures::TryFutureExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serenity::{
@@ -690,21 +690,45 @@ async fn handle_message(db: &SqlitePool, ctx: &ClientContext, msg: &Message) -> 
     .await?;
 
     for id in webhook_ids {
-        let webhook = id.to_webhook(&ctx).await?;
-        webhook
-            .execute(&ctx, false, |w| {
-                //w.content(&msg.content);
-                let embed = Embed::fake(|e| {
-                    e /*.author(|a| a.name(username).url(user_url).icon_url(icon_url))*/
-                        .color(Color::BLUE)
-                        .description(&msg.content)
-                });
-                w.embeds(vec![embed])
-            })
-            .await
-            .context(format!("Failed to execute webhook:\n{:#?}", webhook))?;
+        match execute_webhook(id, ctx, msg).await {
+            Err(e) => println!("{:?}", e),
+            _ => (),
+        }
     }
 
+    Ok(())
+}
+
+async fn execute_webhook(id: WebhookId, ctx: &ClientContext, msg: &Message) -> Result<()> {
+    let webhook = id
+        .to_webhook(&ctx)
+        .await
+        .context(format!("Failed to retrieve webhook from Discord: {id}"))?;
+    let avatar_url = match msg.author.avatar_url() {
+        Some(url) => url,
+        None => "".to_owned(),
+    };
+    // webhook
+    //     .edit(
+    //         &ctx,
+    //         Some(&msg.author.name),
+    //         Some(&image),
+    //     )
+    //     .await
+    //     .context(format!("Failed to edit webhook:\n{:#?}", webhook))?;
+    webhook
+        .execute(&ctx, false, |w| {
+            //w.content(&msg.content);
+            let embed = Embed::fake(|e| {
+                e /*.author(|a| a.name(username).url(user_url).icon_url(icon_url))*/
+                    .description(&msg.content)
+            });
+            w.embeds(vec![embed])
+                .username(&msg.author.name)
+                .avatar_url(&avatar_url)
+        })
+        .await
+        .context(format!("Failed to execute webhook:\n{:#?}", webhook))?;
     Ok(())
 }
 
