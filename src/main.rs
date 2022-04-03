@@ -22,6 +22,7 @@ use serenity::{
             autocomplete::AutocompleteInteraction,
             Interaction, InteractionResponseType,
         },
+        webhook::Webhook,
     },
     prelude::*,
     utils::Color,
@@ -421,40 +422,42 @@ async fn handle_input(msg: String, data: Arc<Mutex<Data>>) -> bool {
 }
 
 async fn create_server_mapping(db: &SqlitePool, ctx: &ClientContext, id: &GuildId) -> Result<()> {
-    let guild_id = id.0 as i64;
+    let guild = id.0 as i64;
     let name = id
         .name(&ctx)
         .await
-        .context(format!("Failed to get name from guild id: {guild_id}"))?;
+        .context(format!("Failed to get name from guild id: {guild}"))?;
 
     sqlx::query!(
         "INSERT INTO Guilds (id, name, is_banned) VALUES (?, ?, false)",
-        guild_id,
+        guild,
         name,
     )
     .execute(db)
     .await
-    .map_err(|e| {
-        Error::new(e).context(format!("Failed to insert guild into the database: {name}"))
-    })?;
+    .map_err(|e| anyhow!("Guild already exists in the database: {name}"))?;
 
     let channels: Vec<(ChannelId, GuildChannel)> =
         id.channels(&ctx).await.unwrap().into_iter().collect();
+
     for (ch_id, ch) in channels {
         if ch.kind == ChannelType::Text {
-            let channel_id = ch_id.0 as i64;
+            let webhook = ch.create_webhook(&ctx, "Analyst Bot").await.unwrap().id.0 as i64;
+            let channel = ch_id.0 as i64;
             let name = format!("#{}", ch.name);
             sqlx::query!(
-                "INSERT INTO Channels (id, name, guild) VALUES (?, ?, ?)",
-                channel_id,
+                "INSERT INTO Channels (id, name, guild, webhook) VALUES (?, ?, ?, ?)",
+                channel,
                 name,
-                guild_id,
+                guild,
+                webhook
             )
             .execute(db)
             .await
             .unwrap();
         }
     }
+
     Ok(())
 }
 
@@ -628,6 +631,45 @@ impl EventHandler for Handler {
                                     .set_autocomplete(true)
                             })
                     })
+                    .create_application_command(|command| {
+                        command
+                            .name("mention-add")
+                            .description("Add mentions to the target channel")
+                            .create_option(|option| {
+                                option
+                                    .name("target_server")
+                                    .description("Target server")
+                                    .kind(ApplicationCommandOptionType::String)
+                                    .required(true)
+                                //.set_autocomplete(true)
+                            })
+                            .create_option(|option| {
+                                option
+                                    .name("target_channel")
+                                    .description("Target channel")
+                                    .kind(ApplicationCommandOptionType::String)
+                                    .required(true)
+                                //.set_autocomplete(true)
+                            })
+                            .create_option(|option| {
+                                option
+                                    .name("mentions")
+                                    .description("One or more mentions separated by whitespace")
+                                    .kind(ApplicationCommandOptionType::String)
+                                    .required(true)
+                                //.set_autocomplete(true)
+                            })
+                            .create_option(|option| {
+                                option
+                                    .name("source")
+                                    .description(
+                                        "If set then only messages from this channel are mentioned",
+                                    )
+                                    .kind(ApplicationCommandOptionType::Channel)
+                                    .required(false)
+                                    .channel_types(&[ChannelType::Text])
+                            })
+                    })
             })
             .await;
             let guild_name = id.name(&ctx).await.unwrap();
@@ -667,7 +709,6 @@ async fn handle_message(db: &SqlitePool, ctx: &ClientContext, msg: &Message) -> 
     if msg.author.bot == true {
         return Ok(());
     }
-
     let source = msg.channel_id.0 as i64;
     let user = msg.author.id.0 as i64;
     let webhook_ids: Vec<WebhookId> = sqlx::query!(
@@ -718,14 +759,15 @@ async fn execute_webhook(id: WebhookId, ctx: &ClientContext, msg: &Message) -> R
     //     .context(format!("Failed to edit webhook:\n{:#?}", webhook))?;
     webhook
         .execute(&ctx, false, |w| {
-            //w.content(&msg.content);
             let embed = Embed::fake(|e| {
                 e /*.author(|a| a.name(username).url(user_url).icon_url(icon_url))*/
                     .description(&msg.content)
+                    .color(Color::GOLD)
             });
-            w.embeds(vec![embed])
-                .username(&msg.author.name)
+            w.username(&msg.author.name)
                 .avatar_url(&avatar_url)
+                .embeds(vec![embed])
+                //.content("@here")
         })
         .await
         .context(format!("Failed to execute webhook:\n{:#?}", webhook))?;
@@ -1084,132 +1126,88 @@ async fn name_to_ids(
     .map_err(|e| Error::new(e).context("Failed to convert server/channel names to ids"))
 }
 
-async fn get_webhook_id(
-    db: &SqlitePool,
-    user_id: &UserId,
-    target_channel_id: &ChannelId,
-) -> Result<Option<WebhookId>> {
-    let user = user_id.0 as i64;
-    let target = target_channel_id.0 as i64;
-    sqlx::query!(
-        "
-        SELECT id as \"webhook_id: i64\"\n\
-        FROM Webhooks\n\
-        WHERE Webhooks.user = ? AND Webhooks.target = ?
-        ",
-        user,
-        target,
-    )
-    .fetch_optional(db)
-    .and_then(|row| async move { Ok(row.map(|row| WebhookId(row.webhook_id as u64))) })
-    .await
-    .map_err(|e| Error::new(e).context("Failed to retrieve webhook from database"))
-}
-
-async fn maybe_add_webhook(
-    db: &SqlitePool,
-    user_id: &UserId,
-    target_channel_id: &ChannelId,
-    ctx: &ClientContext,
-) -> Result<WebhookId> {
-    match get_webhook_id(db, user_id, target_channel_id).await? {
-        Some(id) => return Ok(id),
-        None => (),
-    }
-    let username = user_id.to_user(&ctx).await?.name.clone();
-    let target_channel = target_channel_id
-        .to_channel(&ctx)
-        .await?
-        .guild()
-        .ok_or(anyhow!("Failed to get the guild channel"))?;
-
-    let webhook_id = target_channel.create_webhook(&ctx, username).await?.id;
-    let id = webhook_id.0 as i64;
-    let user = user_id.0 as i64;
-    let target = target_channel_id.0 as i64;
-    let result = sqlx::query!(
-        "INSERT OR REPLACE INTO Webhooks (id, target, user) VALUES (?, ?, ?)",
-        id,
-        target,
-        user,
-    )
-    .execute(db)
-    .await;
-    match result {
-        Ok(_) => Ok(webhook_id),
-        Err(e) => Err(Error::new(e).context("Failed to insert webhook into the database")),
-    }
-}
+// async fn get_webhook_id(
+//     db: &SqlitePool,
+//     user_id: &UserId,
+//     target_channel_id: &ChannelId,
+// ) -> Result<Option<WebhookId>> {
+//     let user = user_id.0 as i64;
+//     let target = target_channel_id.0 as i64;
+//     sqlx::query!(
+//         "
+//         SELECT id as \"webhook_id: i64\"\n\
+//         FROM Webhooks\n\
+//         WHERE Webhooks.user = ? AND Webhooks.target = ?
+//         ",
+//         user,
+//         target,
+//     )
+//     .fetch_optional(db)
+//     .and_then(|row| async move { Ok(row.map(|row| WebhookId(row.webhook_id as u64))) })
+//     .await
+//     .map_err(|e| Error::new(e).context("Failed to retrieve webhook from database"))
+// }
 
 async fn connection_exists(
     db: &SqlitePool,
     source_channel_id: &ChannelId,
     target_channel_id: &ChannelId,
-    webhook_id: &WebhookId,
-) -> Result<bool, sqlx::Error> {
+    user_id: &UserId,
+) -> Result<bool> {
     let source = source_channel_id.0 as i64;
     let target = target_channel_id.0 as i64;
-    let webhook = webhook_id.0 as i64;
-    let count: Result<i32, sqlx::Error> = sqlx::query!(
+    let user = user_id.0 as i64;
+    let count = sqlx::query!(
         "
         SELECT COUNT(1) as count\n\
         FROM Connections\n\
-        WHERE Connections.source = ? AND Connections.target = ? AND Connections.webhook = ?
+        WHERE source = ? AND target = ? AND user = ?
         ",
         source,
         target,
-        webhook
+        user,
     )
     .fetch_one(db)
     .and_then(|row| async move { Ok(row.count) })
-    .await;
-    match count {
-        Ok(count) => return Ok(count != 0),
-        Err(why) => {
-            println!("Error occured when trying to read connections from database: {why}");
-            Err(why)
-        }
-    }
+    .await
+    .map_err(|e| Error::new(e).context("Failed to count existing connections in the database"))?;
+
+    Ok(count != 0)
 }
 
 async fn maybe_add_connection(
     db: &SqlitePool,
     source_channel_id: &ChannelId,
     target_channel_id: &ChannelId,
-    webhook_id: &WebhookId,
     user_id: &UserId,
-) -> Result<bool, sqlx::Error> {
-    match connection_exists(db, source_channel_id, target_channel_id, webhook_id).await {
+    webhook_id: &WebhookId,
+) -> Result<bool> {
+    match connection_exists(db, source_channel_id, target_channel_id, user_id).await {
         Ok(true) => return Ok(false),
         Err(why) => return Err(why),
         _ => (),
     }
     let source = source_channel_id.0 as i64;
     let target = target_channel_id.0 as i64;
-    let webhook = webhook_id.0 as i64;
     let user = user_id.0 as i64;
-    let result = sqlx::query!(
-        "INSERT OR REPLACE INTO Connections (source, target, webhook, user) VALUES (?, ?, ?, ?)",
+    let webhook = webhook_id.0 as i64;
+    sqlx::query!(
+        "INSERT INTO Connections (source, target, user, webhook) VALUES (?, ?, ?, ?)",
         source,
         target,
-        webhook,
-        user
+        user,
+        webhook
     )
     .execute(db)
-    .await;
-    match result {
-        Ok(_) => Ok(true),
-        Err(why) => {
-            println!("Failed to insert new connection into the database: {why}");
-            Err(why)
-        }
-    }
+    .await
+    .map_err(|e| Error::new(e).context("Failed to insert new connection into the database"))?;
+
+    Ok(true)
 }
 
 async fn handle_connect_command(
     db: &SqlitePool,
     command: &ApplicationCommandInteraction,
-    ctx: &ClientContext,
 ) -> Result<CommandResponse> {
     let options = &command.data.options;
     let source = get_channel_opt("source", options)?;
@@ -1218,19 +1216,18 @@ async fn handle_connect_command(
     let (_target_server_id, target_channel_id) =
         name_to_ids(db, target_server_name, target_channel_name).await?;
 
-    let webhook_id = maybe_add_webhook(db, &command.user.id, &target_channel_id, &ctx)
-        .await
-        .context(format!(
-            "Internal error, failed to create webhook in <#{}>",
-            target_channel_id.as_u64()
-        ))?;
+    let id = target_channel_id.0 as i64;
+    let webhook_id = sqlx::query!("SELECT webhook FROM Channels WHERE id = ?", id)
+        .fetch_one(db)
+        .and_then(|record| async move { Ok(WebhookId(record.webhook as u64)) })
+        .await?;
 
     let result = maybe_add_connection(
         db,
         &source.id,
         &target_channel_id,
-        &webhook_id,
         &command.user.id,
+        &webhook_id,
     )
     .await?;
 
@@ -1445,17 +1442,98 @@ async fn handle_wipe_command(
     Ok(CommandResponse { title, msg })
 }
 
+async fn mention_exists(
+    db: &SqlitePool,
+    source: &ChannelId,
+    target: &ChannelId,
+    mention: &str,
+) -> Result<bool> {
+    let source = source.0 as i64;
+    let target = target.0 as i64;
+    let count = sqlx::query!(
+        "
+        SELECT COUNT(1) as count\n\
+        FROM Mentions\n\
+        WHERE source = ? AND target = ? AND mention = ?
+        ",
+        source,
+        target,
+        mention
+    )
+    .fetch_one(db)
+    .and_then(|row| async move { Ok(row.count) })
+    .await
+    .map_err(|e| Error::new(e).context("Failed to count existing mentions in the database"))?;
+
+    Ok(count != 0)
+}
+
+async fn mention_exists_no_source(
+    db: &SqlitePool,
+    target: &ChannelId,
+    mention: &str,
+) -> Result<bool> {
+    let target = target.0 as i64;
+    let count = sqlx::query!(
+        "
+        SELECT COUNT(1) as count\n\
+        FROM Mentions\n\
+        WHERE source IS NULL AND target = ? AND mention = ?
+        ",
+        target,
+        mention
+    )
+    .fetch_one(db)
+    .and_then(|row| async move { Ok(row.count) })
+    .await
+    .map_err(|e| Error::new(e).context("Failed to count existing mentions in the database"))?;
+
+    Ok(count != 0)
+}
+
+async fn handle_mention_add(
+    db: &SqlitePool,
+    command: &ApplicationCommandInteraction,
+) -> Result<CommandResponse> {
+    let options = &command.data.options;
+    let target_server = get_string_opt("target_server", options)?;
+    let target_channel = get_string_opt("target_channel", options)?;
+    let mentions: Vec<&str> = get_string_opt("mentions", options)?.split(' ').collect();
+
+    println!("Server: {}", target_server);
+    println!("Channel: {}", target_channel);
+
+    let (_target_server_id, target_channel_id) =
+        name_to_ids(db, target_server, target_channel).await?;
+
+    println!("Mentions: {:#?}", mentions);
+    //let source = ChannelId(948272822441091144);
+    //let target = ChannelId(945744285108690944);
+
+    // println!("Exists: {}", mention_exists(db, &source, &target, m).await?);
+    // println!(
+    //     "Exists [No source]: {}",
+    //     mention_exists_no_source(db, &target, m).await?
+    // );
+
+    Ok(CommandResponse {
+        title: "Mentions".to_owned(),
+        msg: format!("Added: [{}] for <#{}>", mentions.join(" "), target_channel_id),
+    })
+}
+
 async fn handle_application_command(
     db: &SqlitePool,
     command: &ApplicationCommandInteraction,
     ctx: &ClientContext,
 ) {
     let result = match command.data.name.as_str() {
-        "connect" => handle_connect_command(db, command, ctx).await,
+        "connect" => handle_connect_command(db, command).await,
         "disconnect" => handle_disconnect_command(db, command).await,
         "disconnect-all" => handle_disconnect_all_command(db, command).await,
         "list-connections" => handle_list_connections_command(db, command).await,
         "wipe" => handle_wipe_command(db, command).await,
+        "mention-add" => handle_mention_add(db, command).await,
         _ => Err(anyhow!(
             "Unknown command\n**{}**",
             command.data.name.as_str()
@@ -1536,7 +1614,7 @@ async fn main() {
     // !HACK (this should be saved in the TOKEN file)
     let application_id: u64 = 936607788493307944;
 
-    let mut client = Client::builder(&discord_token)
+    let mut client = Client::builder(&discord_token.trim())
         .event_handler(Handler {
             data: data.clone(),
             db,
