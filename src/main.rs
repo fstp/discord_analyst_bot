@@ -712,6 +712,7 @@ async fn get_mentions(
 ) -> Result<Vec<String>> {
     let target = target.0 as i64;
     let source = source.0 as i64;
+    let user = user.0 as i64;
 
     println!("target: {target}");
     println!("source: {source}");
@@ -720,9 +721,10 @@ async fn get_mentions(
         "
         SELECT mention\n\
         FROM Mentions\n\
-        WHERE source IS NULL AND target = ?
+        WHERE source IS NULL AND target = ? AND user = ?
         ",
-        target
+        target,
+        user
     )
     .fetch_all(db)
     .and_then(|rows| async move { Ok(rows.into_iter().map(|row| row.mention).collect()) })
@@ -733,10 +735,11 @@ async fn get_mentions(
         "
         SELECT mention\n\
         FROM Mentions\n\
-        WHERE source = ? AND target = ?
+        WHERE source = ? AND target = ? AND user = ?
         ",
         source,
-        target
+        target,
+        user
     )
     .fetch_all(db)
     .and_then(|rows| async move { Ok(rows.into_iter().map(|row| row.mention).collect()) })
