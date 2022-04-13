@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS "Mentions" (
   "source"      INTEGER,
   "target"      INTEGER             NOT NULL,
   "mention"     TEXT                NOT NULL,
+  "user"        INTEGER             NOT NULL,
   FOREIGN KEY ("source")  REFERENCES "Channels"("id") ON DELETE CASCADE,
   FOREIGN KEY ("target")  REFERENCES "Channels"("id") ON DELETE CASCADE
 );

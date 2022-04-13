@@ -614,11 +614,11 @@ impl EventHandler for Handler {
                     .create_application_command(|command| {
                         command
                             .name("list-connections")
-                            .description("List all the active connections for a particular server")
+                            .description("List all the active connections between all servers")
                     })
                     .create_application_command(|command| {
                         command
-                            .name("wipe")
+                            .name("wipe-connections")
                             .description(
                                 "[WARNING] Will remove ALL connections to/from the selected server",
                             )
@@ -641,7 +641,7 @@ impl EventHandler for Handler {
                                     .description("Target server")
                                     .kind(ApplicationCommandOptionType::String)
                                     .required(true)
-                                //.set_autocomplete(true)
+                                    .set_autocomplete(true)
                             })
                             .create_option(|option| {
                                 option
@@ -649,7 +649,7 @@ impl EventHandler for Handler {
                                     .description("Target channel")
                                     .kind(ApplicationCommandOptionType::String)
                                     .required(true)
-                                //.set_autocomplete(true)
+                                    .set_autocomplete(true)
                             })
                             .create_option(|option| {
                                 option
@@ -657,7 +657,6 @@ impl EventHandler for Handler {
                                     .description("One or more mentions separated by whitespace")
                                     .kind(ApplicationCommandOptionType::String)
                                     .required(true)
-                                //.set_autocomplete(true)
                             })
                             .create_option(|option| {
                                 option
@@ -705,6 +704,52 @@ impl EventHandler for Handler {
     }
 }
 
+async fn get_mentions(
+    db: &SqlitePool,
+    target: &ChannelId,
+    source: &ChannelId,
+    user: &UserId
+) -> Result<Vec<String>> {
+    let target = target.0 as i64;
+    let source = source.0 as i64;
+
+    println!("target: {target}");
+    println!("source: {source}");
+
+    let mut mentions_from_all: Vec<String> = sqlx::query!(
+        "
+        SELECT mention\n\
+        FROM Mentions\n\
+        WHERE source IS NULL AND target = ?
+        ",
+        target
+    )
+    .fetch_all(db)
+    .and_then(|rows| async move { Ok(rows.into_iter().map(|row| row.mention).collect()) })
+    .map_err(|e| Error::new(e).context("Failed to retrieve mentions (no source) from database"))
+    .await?;
+    
+    let mut mentions_from_source: Vec<String> = sqlx::query!(
+        "
+        SELECT mention\n\
+        FROM Mentions\n\
+        WHERE source = ? AND target = ?
+        ",
+        source,
+        target
+    )
+    .fetch_all(db)
+    .and_then(|rows| async move { Ok(rows.into_iter().map(|row| row.mention).collect()) })
+    .map_err(|e| Error::new(e).context("Failed to retrieve mentions (from source) from database"))
+    .await?;
+
+    mentions_from_all.append(&mut mentions_from_source);
+    mentions_from_all.sort_unstable();
+    mentions_from_all.dedup();
+
+    Ok(mentions_from_all)
+}
+
 async fn handle_message(db: &SqlitePool, ctx: &ClientContext, msg: &Message) -> Result<()> {
     if msg.author.bot == true {
         return Ok(());
@@ -731,7 +776,14 @@ async fn handle_message(db: &SqlitePool, ctx: &ClientContext, msg: &Message) -> 
     .await?;
 
     for id in webhook_ids {
-        match execute_webhook(id, ctx, msg).await {
+        let webhook = id
+            .to_webhook(&ctx)
+            .await
+            .context(format!("Failed to retrieve webhook from Discord: {id}"))?;
+        let target = &webhook.channel_id;
+        let source = &msg.channel_id;
+        let mentions = get_mentions(db, target, source, &msg.author.id).await?;
+        match execute_webhook(&webhook, ctx, msg, &mentions).await {
             Err(e) => println!("{:?}", e),
             _ => (),
         }
@@ -740,11 +792,12 @@ async fn handle_message(db: &SqlitePool, ctx: &ClientContext, msg: &Message) -> 
     Ok(())
 }
 
-async fn execute_webhook(id: WebhookId, ctx: &ClientContext, msg: &Message) -> Result<()> {
-    let webhook = id
-        .to_webhook(&ctx)
-        .await
-        .context(format!("Failed to retrieve webhook from Discord: {id}"))?;
+async fn execute_webhook(
+    webhook: &Webhook,
+    ctx: &ClientContext,
+    msg: &Message,
+    mentions: &Vec<String>,
+) -> Result<()> {
     let avatar_url = match msg.author.avatar_url() {
         Some(url) => url,
         None => "".to_owned(),
@@ -767,7 +820,7 @@ async fn execute_webhook(id: WebhookId, ctx: &ClientContext, msg: &Message) -> R
             w.username(&msg.author.name)
                 .avatar_url(&avatar_url)
                 .embeds(vec![embed])
-                //.content("@here")
+                .content(mentions.join("\n"))
         })
         .await
         .context(format!("Failed to execute webhook:\n{:#?}", webhook))?;
@@ -939,7 +992,8 @@ async fn handle_autocomplete(
     let result: Result<AutocompleteResponse> = match autocomplete.data.name.as_str() {
         "connect" => handle_connect_autocomplete(db, autocomplete).await,
         "disconnect" => handle_disconnect_autocomplete(db, autocomplete).await,
-        "wipe" => handle_wipe_autocomplete(db, autocomplete).await,
+        "wipe-connections" => handle_wipe_connections_autocomplete(db, autocomplete).await,
+        "mention-add" => handle_mention_add_autocomplete(db, autocomplete).await,
         s => Err(anyhow!("Unhandled autocomplete:\n{s}")),
     };
     match result {
@@ -959,7 +1013,34 @@ async fn handle_autocomplete(
     }
 }
 
-async fn handle_wipe_autocomplete(
+async fn handle_mention_add_autocomplete(
+    db: &SqlitePool,
+    autocomplete: &AutocompleteInteraction,
+) -> Result<AutocompleteResponse> {
+    let param_target_server = find_param("target_server", &autocomplete)?;
+    let param_target_channel = find_param("target_channel", &autocomplete);
+
+    let server_name = match &param_target_server.value {
+        Some(serde_json::Value::String(input)) => input.clone(),
+        Some(val) => bail!("Unexpected parameter type (expected string):\n{:#?}", val),
+        None => bail!("No parameter value found"),
+    };
+
+    if param_target_server.focused {
+        connect_target_server_autocomplete(db, &server_name).await
+    } else if param_target_channel.is_ok() {
+        let param_target_channel = param_target_channel.unwrap();
+        if param_target_channel.focused {
+            connect_target_channel_autocomplete(db, &server_name, &param_target_channel).await
+        } else {
+            bail!("Target channel not focused")
+        }
+    } else {
+        bail!("Invalid parameter focus")
+    }
+}
+
+async fn handle_wipe_connections_autocomplete(
     db: &SqlitePool,
     autocomplete: &AutocompleteInteraction,
 ) -> Result<AutocompleteResponse> {
@@ -1405,7 +1486,7 @@ async fn handle_list_connections_command(
     })
 }
 
-async fn handle_wipe_command(
+async fn handle_wipe_connections_command(
     db: &SqlitePool,
     command: &ApplicationCommandInteraction,
 ) -> Result<CommandResponse> {
@@ -1438,7 +1519,7 @@ async fn handle_wipe_command(
     .map_err(|e| Error::new(e).context("Failed to wipe connections for server in the database"))?;
 
     let title = "Wiped".to_owned();
-    let msg = format!("Removed all connections: __**{server_name}**__");
+    let msg = format!("Removed all connections to/from: __**{server_name}**__");
     Ok(CommandResponse { title, msg })
 }
 
@@ -1491,34 +1572,85 @@ async fn mention_exists_no_source(
     Ok(count != 0)
 }
 
-async fn handle_mention_add(
+async fn handle_mention_add_command(
     db: &SqlitePool,
     command: &ApplicationCommandInteraction,
 ) -> Result<CommandResponse> {
     let options = &command.data.options;
+    let source = get_channel_opt("source", options);
     let target_server = get_string_opt("target_server", options)?;
     let target_channel = get_string_opt("target_channel", options)?;
     let mentions: Vec<&str> = get_string_opt("mentions", options)?.split(' ').collect();
 
-    println!("Server: {}", target_server);
-    println!("Channel: {}", target_channel);
+    println!("Target server: {}", target_server);
+    println!("Target channel: {}", target_channel);
+
+    if let Ok(ch) = source {
+        println!("Source channel: {}", ch.name);
+    }
 
     let (_target_server_id, target_channel_id) =
         name_to_ids(db, target_server, target_channel).await?;
 
-    println!("Mentions: {:#?}", mentions);
-    //let source = ChannelId(948272822441091144);
-    //let target = ChannelId(945744285108690944);
+    for m in &mentions {
+        let user = command.user.id.0 as i64;
+        let target = target_channel_id.0 as i64;
 
-    // println!("Exists: {}", mention_exists(db, &source, &target, m).await?);
-    // println!(
-    //     "Exists [No source]: {}",
-    //     mention_exists_no_source(db, &target, m).await?
-    // );
+        if let Ok(ch) = source {
+            let source = ch.id.0 as i64;
+            let exists = mention_exists(db, &ch.id, &target_channel_id, m).await?;
+            if !exists {
+                let result = sqlx::query!(
+                    "INSERT INTO Mentions (source, target, mention, user) VALUES (?, ?, ?, ?)",
+                    source,
+                    target,
+                    m,
+                    user
+                )
+                .execute(db)
+                .await
+                .map_err(|e| Error::new(e).context(format!("Failed to insert mention {m}")));
+                match result {
+                    Ok(_) => println!("Added mention (with source): {m}"),
+                    Err(e) => println!("{e}"),
+                };
+            }
+        } else {
+            // No source channel provided.
+            let exists = mention_exists_no_source(db, &target_channel_id, m).await?;
+            if !exists {
+                let result = sqlx::query!(
+                    "INSERT INTO Mentions (source, target, mention, user) VALUES (NULL, ?, ?, ?)",
+                    target,
+                    m,
+                    user
+                )
+                .execute(db)
+                .await
+                .map_err(|e| Error::new(e).context(format!("Failed to insert mention {m}")));
+                match result {
+                    Ok(_) => println!("Added mention (no source): {m}"),
+                    Err(e) => println!("{e}"),
+                };
+            }
+        }
+    }
+
+    let from_source = if let Ok(ch) = source {
+        format!("\nSource channel: <#{}>", ch.id)
+    } else {
+        "".to_owned()
+    };
 
     Ok(CommandResponse {
         title: "Mentions".to_owned(),
-        msg: format!("Added: [{}] for <#{}>", mentions.join(" "), target_channel_id),
+        msg: format!(
+            "Added mentions: {}\nTarget server: __**{}**__\nTarget channel <#{}>{}",
+            mentions.join("\n"),
+            target_server,
+            target_channel_id,
+            from_source
+        ),
     })
 }
 
@@ -1532,10 +1664,10 @@ async fn handle_application_command(
         "disconnect" => handle_disconnect_command(db, command).await,
         "disconnect-all" => handle_disconnect_all_command(db, command).await,
         "list-connections" => handle_list_connections_command(db, command).await,
-        "wipe" => handle_wipe_command(db, command).await,
-        "mention-add" => handle_mention_add(db, command).await,
+        "wipe-connections" => handle_wipe_connections_command(db, command).await,
+        "mention-add" => handle_mention_add_command(db, command).await,
         _ => Err(anyhow!(
-            "Unknown command\n**{}**",
+            "Unknown command: **{}**",
             command.data.name.as_str()
         )),
     };
