@@ -633,6 +633,21 @@ impl EventHandler for Handler {
                     })
                     .create_application_command(|command| {
                         command
+                            .name("wipe-mentions")
+                            .description(
+                                "[WARNING] Will remove ALL mentions to/from channels in the selected server",
+                            )
+                            .create_option(|option| {
+                                option
+                                    .name("server")
+                                    .description("Server name")
+                                    .kind(ApplicationCommandOptionType::String)
+                                    .required(true)
+                                    .set_autocomplete(true)
+                            })
+                    })
+                    .create_application_command(|command| {
+                        command
                             .name("mention-add")
                             .description("Add mentions to the target channel")
                             .create_option(|option| {
@@ -717,12 +732,15 @@ async fn get_mentions(
     println!("target: {target}");
     println!("source: {source}");
 
-    let mut mentions_from_all: Vec<String> = sqlx::query!(
+    let mut mentions: Vec<String> = sqlx::query!(
         "
         SELECT mention\n\
         FROM Mentions\n\
-        WHERE source IS NULL AND target = ? AND user = ?
+        WHERE (source IS NULL AND target = ? AND user = ?) OR (source = ? AND target = ? AND user = ?)
         ",
+        target,
+        user,
+        source,
         target,
         user
     )
@@ -730,27 +748,11 @@ async fn get_mentions(
     .and_then(|rows| async move { Ok(rows.into_iter().map(|row| row.mention).collect()) })
     .map_err(|e| Error::new(e).context("Failed to retrieve mentions (no source) from database"))
     .await?;
-    
-    let mut mentions_from_source: Vec<String> = sqlx::query!(
-        "
-        SELECT mention\n\
-        FROM Mentions\n\
-        WHERE source = ? AND target = ? AND user = ?
-        ",
-        source,
-        target,
-        user
-    )
-    .fetch_all(db)
-    .and_then(|rows| async move { Ok(rows.into_iter().map(|row| row.mention).collect()) })
-    .map_err(|e| Error::new(e).context("Failed to retrieve mentions (from source) from database"))
-    .await?;
 
-    mentions_from_all.append(&mut mentions_from_source);
-    mentions_from_all.sort_unstable();
-    mentions_from_all.dedup();
+    mentions.sort_unstable();
+    mentions.dedup();
 
-    Ok(mentions_from_all)
+    Ok(mentions)
 }
 
 async fn handle_message(db: &SqlitePool, ctx: &ClientContext, msg: &Message) -> Result<()> {
@@ -996,6 +998,7 @@ async fn handle_autocomplete(
         "connect" => handle_connect_autocomplete(db, autocomplete).await,
         "disconnect" => handle_disconnect_autocomplete(db, autocomplete).await,
         "wipe-connections" => handle_wipe_connections_autocomplete(db, autocomplete).await,
+        "wipe-mentions" => handle_wipe_mentions_autocomplete(db, autocomplete).await,
         "mention-add" => handle_mention_add_autocomplete(db, autocomplete).await,
         s => Err(anyhow!("Unhandled autocomplete:\n{s}")),
     };
@@ -1044,6 +1047,21 @@ async fn handle_mention_add_autocomplete(
 }
 
 async fn handle_wipe_connections_autocomplete(
+    db: &SqlitePool,
+    autocomplete: &AutocompleteInteraction,
+) -> Result<AutocompleteResponse> {
+    let param_target_server = find_param("server", &autocomplete)?;
+
+    let server_name = match &param_target_server.value {
+        Some(serde_json::Value::String(input)) => input.clone(),
+        Some(val) => bail!("Unexpected parameter type (expected string):\n{:#?}", val),
+        None => bail!("No parameter value found"),
+    };
+
+    connect_target_server_autocomplete(db, &server_name).await
+}
+
+async fn handle_wipe_mentions_autocomplete(
     db: &SqlitePool,
     autocomplete: &AutocompleteInteraction,
 ) -> Result<AutocompleteResponse> {
@@ -1521,8 +1539,45 @@ async fn handle_wipe_connections_command(
     .await
     .map_err(|e| Error::new(e).context("Failed to wipe connections for server in the database"))?;
 
-    let title = "Wiped".to_owned();
+    let title = "Wiped Connections".to_owned();
     let msg = format!("Removed all connections to/from: __**{server_name}**__");
+    Ok(CommandResponse { title, msg })
+}
+
+async fn handle_wipe_mentions_command(
+    db: &SqlitePool,
+    command: &ApplicationCommandInteraction,
+) -> Result<CommandResponse> {
+    let options = &command.data.options;
+    let server_name = get_string_opt("server", options)?;
+    let user = command.user.id.0 as i64;
+
+    sqlx::query!(
+        "
+        DELETE FROM Mentions\n\
+        WHERE Mentions.id in (\n\
+            SELECT Mentions.id from Mentions\n\
+            LEFT JOIN Channels source_channel\n\
+            ON Mentions.source = source_channel.id\n\
+            LEFT JOIN Guilds source_guild\n\
+            ON source_guild.id = source_channel.guild\n\
+            JOIN Channels target_channel\n\
+            ON Mentions.target = target_channel.id\n\
+            JOIN Guilds target_guild\n\
+            ON target_guild.id = target_channel.guild\n\
+            WHERE (source_guild.name = ? OR target_guild.name = ?) AND user = ?\n\
+        );
+        ",
+        server_name,
+        server_name,
+        user,
+    )
+    .execute(db)
+    .await
+    .map_err(|e| Error::new(e).context("Failed to wipe mentions for server in the database"))?;
+
+    let title = "Wiped Mentions".to_owned();
+    let msg = format!("Removed all mentions to/from: __**{server_name}**__");
     Ok(CommandResponse { title, msg })
 }
 
@@ -1585,13 +1640,6 @@ async fn handle_mention_add_command(
     let target_channel = get_string_opt("target_channel", options)?;
     let mentions: Vec<&str> = get_string_opt("mentions", options)?.split(' ').collect();
 
-    println!("Target server: {}", target_server);
-    println!("Target channel: {}", target_channel);
-
-    if let Ok(ch) = source {
-        println!("Source channel: {}", ch.name);
-    }
-
     let (_target_server_id, target_channel_id) =
         name_to_ids(db, target_server, target_channel).await?;
 
@@ -1614,7 +1662,7 @@ async fn handle_mention_add_command(
                 .await
                 .map_err(|e| Error::new(e).context(format!("Failed to insert mention {m}")));
                 match result {
-                    Ok(_) => println!("Added mention (with source): {m}"),
+                    Ok(_) => (),
                     Err(e) => println!("{e}"),
                 };
             }
@@ -1632,7 +1680,7 @@ async fn handle_mention_add_command(
                 .await
                 .map_err(|e| Error::new(e).context(format!("Failed to insert mention {m}")));
                 match result {
-                    Ok(_) => println!("Added mention (no source): {m}"),
+                    Ok(_) => (),
                     Err(e) => println!("{e}"),
                 };
             }
@@ -1648,7 +1696,7 @@ async fn handle_mention_add_command(
     Ok(CommandResponse {
         title: "Mentions".to_owned(),
         msg: format!(
-            "Added mentions: {}\nTarget server: __**{}**__\nTarget channel <#{}>{}",
+            "Added mentions:\n{}\nTarget server: __**{}**__\nTarget channel <#{}>{}",
             mentions.join("\n"),
             target_server,
             target_channel_id,
@@ -1668,6 +1716,7 @@ async fn handle_application_command(
         "disconnect-all" => handle_disconnect_all_command(db, command).await,
         "list-connections" => handle_list_connections_command(db, command).await,
         "wipe-connections" => handle_wipe_connections_command(db, command).await,
+        "wipe-mentions" => handle_wipe_mentions_command(db, command).await,
         "mention-add" => handle_mention_add_command(db, command).await,
         _ => Err(anyhow!(
             "Unknown command: **{}**",
